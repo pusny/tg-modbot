@@ -9,7 +9,7 @@ def _ensure(pkg_spec: str, import_name: str) -> None:
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_spec])
 
 
-_ensure("python-telegram-bot>=20,<22", "telegram")
+_ensure("python-telegram-bot>=21,<22", "telegram")
 _ensure("python-dotenv", "dotenv")
 
 
@@ -141,7 +141,13 @@ RANK_ALIASES = {
 MUTE_PERMS = ChatPermissions(can_send_messages=False)
 UNMUTE_PERMS = ChatPermissions(
     can_send_messages=True,
-    can_send_media_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
     can_send_other_messages=True,
     can_add_web_page_previews=True,
 )
