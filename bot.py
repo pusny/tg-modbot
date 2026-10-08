@@ -38,19 +38,34 @@ def _req(key: str) -> str:
     return val.strip()
 
 
-BOT_TOKEN = _req("BOT_TOKEN")
+def _req_int(key: str, default: Optional[int] = None) -> int:
+    val = os.getenv(key)
+    if val is None or val.strip() == "":
+        if default is None:
+            raise RuntimeError(f"Не задана переменная: {key}")
+        return default
+    return int(val.strip())
 
-ADMIN_CHAT_ID    = -1004441293896
-REPORT_THREAD_ID = 1538
-DB_PATH          = "bot.db"
 
-ANTISPAM_LIMIT   = 7
-ANTISPAM_WINDOW  = 10.0
-ANTISPAM_MUTE_M  = 30
+def _req_float(key: str, default: float) -> float:
+    val = os.getenv(key)
+    if val is None or val.strip() == "":
+        return default
+    return float(val.strip())
 
-ANTIRAID_JOINS    = 10
-ANTIRAID_WINDOW   = 30.0
-ANTIRAID_LOOKBACK = 1800.0
+
+BOT_TOKEN        = _req("BOT_TOKEN")
+ADMIN_CHAT_ID    = _req_int("ADMIN_CHAT_ID")
+REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
+DB_PATH          = os.getenv("DB_PATH", "bot.db")
+
+ANTISPAM_LIMIT   = _req_int("ANTISPAM_LIMIT", 7)
+ANTISPAM_WINDOW  = _req_float("ANTISPAM_WINDOW", 10.0)
+ANTISPAM_MUTE_M  = _req_int("ANTISPAM_MUTE_M", 30)
+
+ANTIRAID_JOINS    = _req_int("ANTIRAID_JOINS", 10)
+ANTIRAID_WINDOW   = _req_float("ANTIRAID_WINDOW", 30.0)
+ANTIRAID_LOOKBACK = _req_float("ANTIRAID_LOOKBACK", 1800.0)
 
 CONNECT_TIMEOUT   = 30.0
 READ_TIMEOUT      = 30.0
@@ -834,17 +849,17 @@ HELP_TEXT = (
     "• <code>/trigger del &lt;слово&gt;</code>\n"
     "• <code>/trigger list</code>\n\n"
     "<b>Кружки:</b>\n"
-    "• <code>/create_circle &lt;имя&gt;</code>\n"
+    "• <code>/create_circle &lt;имя&gt;</code> — в топике, мод+\n"
     "• <code>/join &lt;имя&gt;</code> / <code>/leave &lt;имя&gt;</code>\n"
     "• <code>/circle_info &lt;имя&gt;</code>\n"
     "• <code>/delete_circle &lt;имя&gt;</code>\n\n"
     "<b>Темы / чат:</b>\n"
-    "• <code>/clean &lt;N&gt;</code>\n"
-    "• <code>/links on|off</code>\n\n"
+    "• <code>/clean &lt;N&gt;</code> — снести N сообщений в текущей теме (или в чате)\n"
+    "• <code>/links on|off</code> — запрет ссылок в текущей теме (или в чате)\n\n"
     "<b>Прочее:</b>\n"
-    "• <code>/report [причина]</code>\n"
+    "• <code>/report [причина]</code> — реплай → админ-чат\n"
     "• <code>/profile</code> / <code>/me</code>\n"
-    "• <code>/settings</code>"
+    "• <code>/settings</code> — настройки антиспама"
 )
 
 
