@@ -22,7 +22,7 @@
 ### 1. Клонируй репозиторий
 
 ```
-git clone https://github.com/твой_логин/tg-modbot.git
+git clone https://github.com/pusny/tg-modbot.git
 cd tg-modbot
 ```
 
