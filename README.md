@@ -28,13 +28,33 @@ cd tg-modbot
 
 ### 2. Создай .env
 
-В папке проекта создай файл `.env` со строкой:
+В папке проекта создай `.env` со строками:
 
 ```
 BOT_TOKEN=123456:AAA-твой_токен
+ADMIN_CHAT_ID=чат_админ
+REPORT_THREAD_ID=0
+
+ANTISPAM_LIMIT=7
+ANTISPAM_WINDOW=10
+ANTISPAM_MUTE_M=30
+
+ANTIRAID_JOINS=10
+ANTIRAID_WINDOW=30
+ANTIRAID_LOOKBACK=1800
 ```
 
-Токен получается у [@BotFather](https://t.me/BotFather).
+- `BOT_TOKEN` — токен от [@BotFather](https://t.me/BotFather)
+- `ADMIN_CHAT_ID` — id чата, куда летят репорты и алерты
+- `REPORT_THREAD_ID` — id топика внутри чата (0 = без топика)
+- `ANTISPAM_LIMIT` — сколько сообщений за окно → мут
+- `ANTISPAM_WINDOW` — окно в секундах
+- `ANTISPAM_MUTE_M` — длительность мута в минутах
+- `ANTIRAID_JOINS` — сколько вступлений за окно → тревога
+- `ANTIRAID_WINDOW` — окно в секундах
+- `ANTIRAID_LOOKBACK` — кулдаун между алертами (сек)
+
+Чтобы узнать id чата, добавь бота в чат и перешли любое сообщение боту [@userinfobot](https://t.me/userinfobot) или [@getidsbot](https://t.me/getidsbot).
 
 ### 3. Установи зависимости
 
@@ -42,21 +62,7 @@ BOT_TOKEN=123456:AAA-твой_токен
 pip install -r requirements.txt
 ```
 
-### 4. Настрой параметры в bot.py
-
-В начале `bot.py` есть блок с настройками:
-
-```python
-ADMIN_CHAT_ID    = -1004441293896
-REPORT_THREAD_ID = 1538
-```
-
-- `ADMIN_CHAT_ID` — id чата, куда летят репорты и алерты
-- `REPORT_THREAD_ID` — id топика внутри этого чата (0 = без топика)
-
-Чтобы узнать id чата, добавь бота в чат и перешли любое сообщение боту [@userinfobot](https://t.me/userinfobot) или [@getidsbot](https://t.me/getidsbot).
-
-### 5. Запусти
+### 4. Запусти
 
 ```
 python bot.py
@@ -72,7 +78,7 @@ python bot.py
    - bot token: вставь токен
    - git url: ссылка на репозиторий
 4. Главный файл (точка входа): `bot.py`
-5. В переменных окружения проверь `BOT_TOKEN`
+5. В переменных окружения добавь все переменные из `.env`
 6. Нажми «Создать» и дождись сборки
 
 ## Настройка бота в чате
