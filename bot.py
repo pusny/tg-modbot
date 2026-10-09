@@ -47,19 +47,12 @@ def _req_int(key: str, default: Optional[int] = None) -> int:
     return int(val.strip())
 
 
-def _req_float(key: str, default: float) -> float:
-    val = os.getenv(key)
-    if val is None or val.strip() == "":
-        return default
-    return float(val.strip())
-
-
 BOT_TOKEN        = _req("BOT_TOKEN")
 ADMIN_CHAT_ID    = _req_int("ADMIN_CHAT_ID")
 REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
 DB_PATH          = os.getenv("DB_PATH", "bot.db")
 
-EPHEMERAL_DELAY = 60.0
+DEFAULT_EPHEMERAL_DELAY = 60.0
 MIN_TG_MUTE_SEC = 60
 
 CONNECT_TIMEOUT   = 30.0
@@ -67,10 +60,6 @@ READ_TIMEOUT      = 30.0
 WRITE_TIMEOUT     = 30.0
 POOL_TIMEOUT      = 30.0
 START_RETRY_DELAY = 10.0
-
-ANTIRAID_JOINS    = 10
-ANTIRAID_WINDOW   = 30.0
-ANTIRAID_LOOKBACK = 1800.0
 
 
 from telegram import (
@@ -228,10 +217,24 @@ async def _del_later(bot, chat_id: int, message_id: int, delay: float):
     await safe(bot.delete_message, chat_id, message_id)
 
 
-async def eph(msg, text: str, delay: float = EPHEMERAL_DELAY, bot=None, **kwargs):
+async def _delayed(bot, chat_id: int, message_id: int):
+    """Планирует автоудаление сообщения через ephemeral_delay этого чата."""
+    try:
+        s = await get_settings(chat_id)
+        delay = int(_s(s, "ephemeral_delay", int(DEFAULT_EPHEMERAL_DELAY)))
+    except Exception:
+        delay = int(DEFAULT_EPHEMERAL_DELAY)
+    if delay > 0:
+        _schedule(_del_later(bot, chat_id, message_id, float(delay)))
+
+
+async def eph(msg, text: str, delay: Optional[float] = None, bot=None, **kwargs):
     sent = await safe(msg.reply_text, text, **kwargs)
-    if sent is None or delay <= 0:
+    if sent is None:
         return sent
+    if delay is None:
+        await _delayed(bot or msg.bot if False else (bot or msg.chat.id and bot), msg.chat.id, sent.message_id) if False else None
+    # упрощаем: если bot не передан — попробуем вытащить через get_bot
     actual_bot = bot
     if actual_bot is None:
         try:
@@ -242,11 +245,14 @@ async def eph(msg, text: str, delay: float = EPHEMERAL_DELAY, bot=None, **kwargs
                     actual_bot = await maybe
                 else:
                     actual_bot = maybe
-        except Exception as e:
-            log.debug("eph get_bot fail: %s", e)
+        except Exception:
             actual_bot = None
-    if actual_bot is not None:
-        _schedule(_del_later(actual_bot, msg.chat.id, sent.message_id, delay))
+    if actual_bot is None:
+        return sent
+    if delay is None:
+        await _delayed(actual_bot, msg.chat.id, sent.message_id)
+    elif delay > 0:
+        _schedule(_del_later(actual_bot, msg.chat.id, sent.message_id, float(delay)))
     return sent
 
 
@@ -424,13 +430,19 @@ CREATE TABLE IF NOT EXISTS blacklist (
 """
 
 SETTINGS_MIGRATIONS = [
-    ("triggers_on",      "INTEGER NOT NULL DEFAULT 1"),
-    ("warn_limit",       "INTEGER NOT NULL DEFAULT 3"),
-    ("auto_mute_sec",    "INTEGER NOT NULL DEFAULT 3600"),
-    ("trig_mute_sec",    "INTEGER NOT NULL DEFAULT 3600"),
-    ("default_mute_sec", "INTEGER NOT NULL DEFAULT 600"),
-    ("flood_mute_sec",   "INTEGER NOT NULL DEFAULT 1800"),
-    ("warn_action",      "TEXT NOT NULL DEFAULT 'ban'"),
+    ("triggers_on",       "INTEGER NOT NULL DEFAULT 1"),
+    ("warn_limit",        "INTEGER NOT NULL DEFAULT 3"),
+    ("auto_mute_sec",     "INTEGER NOT NULL DEFAULT 3600"),
+    ("trig_mute_sec",     "INTEGER NOT NULL DEFAULT 3600"),
+    ("default_mute_sec",  "INTEGER NOT NULL DEFAULT 600"),
+    ("flood_mute_sec",    "INTEGER NOT NULL DEFAULT 1800"),
+    ("warn_action",       "TEXT NOT NULL DEFAULT 'ban'"),
+    ("antiraid_joins",    "INTEGER NOT NULL DEFAULT 10"),
+    ("antiraid_window",   "INTEGER NOT NULL DEFAULT 30"),
+    ("antiraid_lookback", "INTEGER NOT NULL DEFAULT 1800"),
+    ("ephemeral_delay",   "INTEGER NOT NULL DEFAULT 60"),
+    ("trig_warn_limit",   "INTEGER NOT NULL DEFAULT 3"),
+    ("links_forbidden",   "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -795,9 +807,7 @@ def mod_action(fn):
             await fn(update, ctx)
         finally:
             if msg is not None and msg.chat.type != "private":
-                _schedule(
-                    _del_later(ctx.bot, msg.chat.id, msg.message_id, EPHEMERAL_DELAY)
-                )
+                await _delayed(ctx.bot, msg.chat.id, msg.message_id)
     return wrapper
 
 
@@ -903,9 +913,13 @@ async def link_guard_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text or not LINK_RE.search(text):
         return
 
+    settings = await get_settings(msg.chat.id)
+    links_forbidden = int(_s(settings, "links_forbidden", 0)) == 1
+
     thread_id = msg.message_thread_id or 0
-    allowed = await get_topic_links_allowed(msg.chat.id, thread_id)
-    if allowed:
+    topic_allowed = await get_topic_links_allowed(msg.chat.id, thread_id)
+
+    if not links_forbidden and topic_allowed:
         return
 
     rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
@@ -913,9 +927,9 @@ async def link_guard_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await safe(msg.delete)
-    await eph(
+    note = await eph(
         msg,
-        "🚫 Ссылки в этой теме запрещены.",
+        "🚫 Ссылки в этом чате запрещены.",
         disable_notification=True,
     )
     raise ApplicationHandlerStop
@@ -957,7 +971,7 @@ async def trigger_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settings):
     uid = user.id
     mention = user.mention_html()
-    warn_limit = int(_s(settings, "warn_limit", 3))
+    trig_warn_limit = int(_s(settings, "trig_warn_limit", 3))
     trig_mute_sec = int(_s(settings, "trig_mute_sec", 3600))
     auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
 
@@ -965,14 +979,14 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
         total = await add_warn(uid, chat_id)
         note = await safe(
             bot.send_message, chat_id,
-            f"⚠️ {mention} — предупреждение (триггер: <code>{esc(word)}</code>). Всего: {total}/{warn_limit}",
+            f"⚠️ {mention} — предупреждение (триггер: <code>{esc(word)}</code>). Всего: {total}/{trig_warn_limit}",
             parse_mode=ParseMode.HTML,
         )
         if note is not None:
-            _schedule(_del_later(bot, chat_id, note.message_id, EPHEMERAL_DELAY))
-        await log_action(bot, None, f"⚠️ Авто-варн (триггер: {word}) {total}/{warn_limit}",
+            await _delayed(bot, chat_id, note.message_id)
+        await log_action(bot, None, f"⚠️ Авто-варн (триггер: {word}) {total}/{trig_warn_limit}",
                          user, "", chat_id)
-        if total >= warn_limit:
+        if total >= trig_warn_limit:
             warn_action = str(_s(settings, "warn_action", "ban")).lower()
             try:
                 if warn_action == "ban":
@@ -980,35 +994,35 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
                     await add_blacklist(uid, chat_id, "auto_ban_warns")
                     await reset_warns(uid, chat_id)
                     note2 = await safe(bot.send_message, chat_id,
-                                       f"🔨 {mention} — забанен ({warn_limit}/{warn_limit} варнов).",
+                                       f"🔨 {mention} — забанен ({trig_warn_limit}/{trig_warn_limit} варнов).",
                                        parse_mode=ParseMode.HTML)
                     if note2 is not None:
-                        _schedule(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
+                        await _delayed(bot, chat_id, note2.message_id)
                     await log_action(bot, None,
-                                     f"🔨 Авто-бан ({warn_limit}/{warn_limit} варнов по триггеру)",
+                                     f"🔨 Авто-бан ({trig_warn_limit}/{trig_warn_limit} варнов по триггеру)",
                                      user, "", chat_id)
                 elif warn_action == "kick":
                     await bot.ban_chat_member(chat_id, uid)
                     await bot.unban_chat_member(chat_id, uid)
                     await reset_warns(uid, chat_id)
                     note2 = await safe(bot.send_message, chat_id,
-                                       f"👢 {mention} — кикнут ({warn_limit}/{warn_limit} варнов).",
+                                       f"👢 {mention} — кикнут ({trig_warn_limit}/{trig_warn_limit} варнов).",
                                        parse_mode=ParseMode.HTML)
                     if note2 is not None:
-                        _schedule(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
+                        await _delayed(bot, chat_id, note2.message_id)
                     await log_action(bot, None,
-                                     f"👢 Авто-кик ({warn_limit}/{warn_limit} варнов по триггеру)",
+                                     f"👢 Авто-кик ({trig_warn_limit}/{trig_warn_limit} варнов по триггеру)",
                                      user, "", chat_id)
                 else:
                     await _mute_user(bot, chat_id, uid, auto_mute_sec)
                     await reset_warns(uid, chat_id)
                     note2 = await safe(bot.send_message, chat_id,
-                                       f"🔇 {mention} — авто-мут на {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}).",
+                                       f"🔇 {mention} — авто-мут на {fmt_seconds(auto_mute_sec)} ({trig_warn_limit}/{trig_warn_limit}).",
                                        parse_mode=ParseMode.HTML)
                     if note2 is not None:
-                        _schedule(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
+                        await _delayed(bot, chat_id, note2.message_id)
                     await log_action(bot, None,
-                                     f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit} варна)",
+                                     f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({trig_warn_limit}/{trig_warn_limit} варна)",
                                      user, "", chat_id)
             except Exception as e:
                 log.debug("auto-warn-action fail (trigger): %s", e)
@@ -1045,24 +1059,28 @@ async def antiraid_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not settings or not settings["antiraid"]:
         return
 
+    antiraid_joins = int(_s(settings, "antiraid_joins", 10))
+    antiraid_window = float(_s(settings, "antiraid_window", 30))
+    antiraid_lookback = float(_s(settings, "antiraid_lookback", 1800))
+
     old_status = cm.old_chat_member.status
     new_status = cm.new_chat_member.status
     if old_status in ("left", "kicked") and new_status in ("member", "restricted"):
         now = time.monotonic()
         bucket = _raid_buckets[chat_id]
         bucket.append(now)
-        while bucket and now - bucket[0] > ANTIRAID_WINDOW:
+        while bucket and now - bucket[0] > antiraid_window:
             bucket.popleft()
 
-        if len(bucket) >= ANTIRAID_JOINS:
+        if len(bucket) >= antiraid_joins:
             last_alert = _raid_alerted.get(chat_id, 0)
-            if now - last_alert < ANTIRAID_LOOKBACK:
+            if now - last_alert < antiraid_lookback:
                 return
             _raid_alerted[chat_id] = now
             await send_admin(
                 ctx.bot,
                 f"🚨 <b>Возможный рейд</b> в чате <code>{chat_id}</code>\n"
-                f"За <b>{int(ANTIRAID_WINDOW)}</b> сек вошло <b>{len(bucket)}</b> новых участников.",
+                f"За <b>{int(antiraid_window)}</b> сек вошло <b>{len(bucket)}</b> новых участников.",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -1650,7 +1668,7 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=mod_kb(msg.chat.id, t.id),
     )
     if sent is not None:
-        _schedule(_del_later(ctx.bot, msg.chat.id, sent.message_id, EPHEMERAL_DELAY))
+        await _delayed(ctx.bot, msg.chat.id, sent.message_id)
 
 
 async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1810,7 +1828,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             **send_kwargs,
         )
         if note is not None:
-            _schedule(_del_later(ctx.bot, target_chat, note.message_id, EPHEMERAL_DELAY))
+            await _delayed(ctx.bot, target_chat, note.message_id)
         await safe(q.answer, "Профиль отправлен")
         return
 
@@ -1827,7 +1845,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     note = await safe(q.message.reply_text, result, parse_mode=ParseMode.HTML)
     if note is not None:
-        _schedule(_del_later(ctx.bot, note.chat.id, note.message_id, EPHEMERAL_DELAY))
+        await _delayed(ctx.bot, note.chat.id, note.message_id)
     await safe(q.answer, "Готово")
 
 
@@ -2034,7 +2052,7 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         **note_kwargs,
     )
     if note is not None:
-        _schedule(_del_later(ctx.bot, msg.chat.id, note.message_id, EPHEMERAL_DELAY))
+        await _delayed(ctx.bot, msg.chat.id, note.message_id)
 
 
 @mod_action
@@ -2186,11 +2204,27 @@ SETTING_ALIASES = {
     "warnaction":   "warn_action",
     "варндействие": "warn_action",
     "варнэкшн":     "warn_action",
+    "arjoins":      "antiraid_joins",
+    "рейдвходы":    "antiraid_joins",
+    "arwindow":     "antiraid_window",
+    "рейдокно":     "antiraid_window",
+    "arlookback":   "antiraid_lookback",
+    "рейдкулдаун":  "antiraid_lookback",
+    "ephemeral":    "ephemeral_delay",
+    "удаление":     "ephemeral_delay",
+    "trigwarn":     "trig_warn_limit",
+    "срварн":       "trig_warn_limit",
+    "trigwarnlimit": "trig_warn_limit",
+    "links":        "links_forbidden",
+    "ссылки":       "links_forbidden",
 }
 
-BOOL_SETTINGS = {"antispam", "antiraid", "triggers_on"}
+BOOL_SETTINGS = {"antispam", "antiraid", "triggers_on", "links_forbidden"}
 
-TIME_SETTINGS = {"flood_mute_sec", "auto_mute_sec", "trig_mute_sec", "default_mute_sec"}
+TIME_SETTINGS = {"flood_mute_sec", "auto_mute_sec", "trig_mute_sec", "default_mute_sec",
+                 "antiraid_window", "antiraid_lookback", "ephemeral_delay"}
+
+INT_SETTINGS = {"warn_limit", "antiraid_joins", "trig_warn_limit"}
 
 CHOICE_SETTINGS = {
     "warn_action": ("mute", "ban", "kick"),
@@ -2205,15 +2239,21 @@ def _settings_help() -> str:
         "<b>Тумблеры (вкл/выкл):</b>\n"
         "• <code>настройки антиспам вкл|выкл</code>\n"
         "• <code>настройки антирейд вкл|выкл</code>\n"
-        "• <code>настройки триггеры вкл|выкл</code>\n\n"
+        "• <code>настройки триггеры вкл|выкл</code>\n"
+        "• <code>настройки ссылки вкл|выкл</code> — глобальный запрет ссылок в чате\n\n"
         "<b>Числа:</b>\n"
-        "• <code>настройки варнлимит N</code> — варнов до авто-наказания\n"
+        "• <code>настройки варнлимит N</code> — варнов до авто-наказания (команда)\n"
+        "• <code>настройки срварн N</code> — отдельный лимит варнов от триггеров\n"
+        "• <code>настройки рейдвходы N</code> — сколько входов за окно → алерт\n"
         "• <code>настройки флуд N 10с</code> — N сообщений за время\n\n"
         "<b>Время:</b>\n"
         "• <code>настройки мутфлуд 30м</code> — мут за флуд\n"
         "• <code>настройки автомут 1ч</code> — длительность авто-мута\n"
         "• <code>настройки триггермут 1ч</code> — мут по триггеру\n"
-        "• <code>настройки дефмут 10м</code> — мут без времени\n\n"
+        "• <code>настройки дефмут 10м</code> — мут без времени\n"
+        "• <code>настройки рейдокно 30с</code> — окно вступлений для антирейда\n"
+        "• <code>настройки рейдкулдаун 30м</code> — кулдаун алертов\n"
+        "• <code>настройки удаление 60с</code> — через сколько бот удаляет свои сообщения (0 = не удалять)\n\n"
         "<b>Действие при N варнах:</b>\n"
         "• <code>настройки варндействие mute</code> — мут\n"
         "• <code>настройки варндействие ban</code> — бан (по умолчанию)\n"
@@ -2237,15 +2277,20 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cur = (
             f"<b>Текущие настройки</b>\n"
             f"🔹 Антиспам: <b>{'вкл' if s['antispam'] else 'выкл'}</b>\n"
-            f"🔹 Антирейд: <b>{'вкл' if s['antiraid'] else 'выкл'}</b>\n"
+            f"🔹 Антирейд: <b>{'вкл' if s['antiraid'] else 'выкл'}</b> "
+            f"(<b>{_s(s, 'antiraid_joins', 10)}</b> входов / <b>{fmt_seconds(int(_s(s, 'antiraid_window', 30)))}</b>, "
+            f"кулдаун <b>{fmt_seconds(int(_s(s, 'antiraid_lookback', 1800)))}</b>)\n"
             f"🔹 Триггеры: <b>{'вкл' if s['triggers_on'] else 'выкл'}</b>\n"
+            f"🔹 Ссылки запрещены: <b>{'да' if _s(s, 'links_forbidden', 0) else 'нет'}</b>\n"
             f"🔹 Флуд: <b>{s['flood_limit']}</b> сообщ. / <b>{fmt_seconds(int(s['flood_window']))}</b>\n"
             f"🔹 Мут за флуд: <b>{fmt_seconds(int(_s(s, 'flood_mute_sec', 1800)))}</b>\n"
             f"🔹 Варнов до авто-наказания: <b>{_s(s, 'warn_limit', 3)}</b>\n"
+            f"🔹 Варнов у триггеров: <b>{_s(s, 'trig_warn_limit', 3)}</b>\n"
             f"🔹 Действие при N варнах: <b>{_s(s, 'warn_action', 'ban')}</b>\n"
             f"🔹 Авто-мут: <b>{fmt_seconds(int(_s(s, 'auto_mute_sec', 3600)))}</b>\n"
             f"🔹 Мут по триггеру: <b>{fmt_seconds(int(_s(s, 'trig_mute_sec', 3600)))}</b>\n"
-            f"🔹 Мут по умолчанию: <b>{fmt_seconds(int(_s(s, 'default_mute_sec', 600)))}</b>\n\n"
+            f"🔹 Мут по умолчанию: <b>{fmt_seconds(int(_s(s, 'default_mute_sec', 600)))}</b>\n"
+            f"🔹 Удаление своих сообщений: <b>{fmt_seconds(int(_s(s, 'ephemeral_delay', 60)))}</b>\n\n"
             + _settings_help()
         )
         await eph(msg, cur, parse_mode=ParseMode.HTML, delay=60.0)
@@ -2324,13 +2369,15 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if key in TIME_SETTINGS:
         secs = parse_setting_time(parts[2])
-        if secs <= 0:
+        if secs <= 0 and parts[2].strip() != "0":
             await eph(msg, "❌ Не распознал время. Пример: <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code>",
                       parse_mode=ParseMode.HTML)
             return
+        if parts[2].strip() == "0":
+            secs = 0
         await set_setting(msg.chat.id, key, secs)
-        await log_action(ctx.bot, user, f"⚙️ {key} → {fmt_seconds(secs)}", "—", "", msg.chat.id)
-        await eph(msg, f"✅ {key_raw} → <b>{fmt_seconds(secs)}</b> ({secs} сек)",
+        await log_action(ctx.bot, user, f"⚙️ {key} → {fmt_seconds(secs) if secs else 'выкл'}", "—", "", msg.chat.id)
+        await eph(msg, f"✅ {key_raw} → <b>{fmt_seconds(secs) if secs else 'выкл'}</b>",
                   parse_mode=ParseMode.HTML)
         return
 
