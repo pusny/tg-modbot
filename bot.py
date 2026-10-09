@@ -68,6 +68,7 @@ ANTIRAID_WINDOW   = _req_float("ANTIRAID_WINDOW", 30.0)
 ANTIRAID_LOOKBACK = _req_float("ANTIRAID_LOOKBACK", 1800.0)
 
 EPHEMERAL_DELAY = 8.0
+MIN_TG_MUTE_SEC = 60
 
 CONNECT_TIMEOUT   = 30.0
 READ_TIMEOUT      = 30.0
@@ -135,23 +136,18 @@ RANK_ALIASES = {
     "owner":           RANK_OWNER,
     "владелец":        RANK_OWNER,
     "создатель":       RANK_OWNER,
-
     "senior_admin":    RANK_SENIOR_ADMIN,
     "старший_админ":   RANK_SENIOR_ADMIN,
     "ст_админ":        RANK_SENIOR_ADMIN,
-
     "junior_admin":    RANK_JUNIOR_ADMIN,
     "младший_админ":   RANK_JUNIOR_ADMIN,
     "мл_админ":        RANK_JUNIOR_ADMIN,
-
     "senior_mod":      RANK_SENIOR_MOD,
     "старший_мод":     RANK_SENIOR_MOD,
     "ст_мод":          RANK_SENIOR_MOD,
-
     "junior_mod":      RANK_JUNIOR_MOD,
     "младший_мод":     RANK_JUNIOR_MOD,
     "мл_мод":          RANK_JUNIOR_MOD,
-
     "user":            RANK_USER,
     "участник":        RANK_USER,
     "юзер":            RANK_USER,
@@ -235,28 +231,25 @@ async def send_admin(bot, text: str, **kwargs):
 
 async def log_action(bot, actor, action: str, target, reason: str = "", chat_id: int = 0):
     if actor is None:
-        actor_m = "—"
-        actor_id = 0
+        actor_line = "🤖 <i>Автоматика</i>"
     else:
-        actor_m = actor.mention_html()
-        actor_id = actor.id
+        actor_line = actor.mention_html()
+        actor_line += f" (<code>{actor.id}</code>)"
 
     if hasattr(target, "mention_html"):
-        target_m = target.mention_html()
-        target_id = target.id
+        target_line = f"{target.mention_html()} (<code>{target.id}</code>)"
     else:
-        target_m = f"<code>{target}</code>"
-        target_id = target
+        target_line = f"<code>{target}</code>"
 
     text = (
-        f"📋 <b>Действие модератора</b>\n"
-        f"👮 Кто: {actor_m} (<code>{actor_id}</code>)\n"
-        f"🎯 Кого: {target_m} (<code>{target_id}</code>)\n"
-        f"⚙️ Что: <b>{action}</b>\n"
-        f"💬 Чат: <code>{chat_id}</code>"
+        f"📋 <b>Действие модератора</b>\n\n"
+        f"👮 <b>Кто:</b> {actor_line}\n"
+        f"🎯 <b>Кого:</b> {target_line}\n"
+        f"⚙️ <b>Что:</b> {action}\n"
+        f"💬 <b>Чат:</b> <code>{chat_id}</code>"
     )
     if reason:
-        text += f"\n📝 Причина: {esc(reason)}"
+        text += f"\n\n📝 <b>Причина:</b> {esc(reason)}"
     await send_admin(bot, text, parse_mode=ParseMode.HTML,
                      disable_web_page_preview=True)
 
@@ -271,6 +264,18 @@ def parse_duration(s: str) -> int:
     except ValueError:
         return 0
     return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit, 0)
+
+
+def parse_setting_time(s: str) -> int:
+    s = s.strip().lower()
+    if not s:
+        return 0
+    if s[-1].isdigit():
+        try:
+            return int(s)
+        except ValueError:
+            return 0
+    return parse_duration(s)
 
 
 def fmt_seconds(sec: int) -> str:
@@ -328,12 +333,17 @@ CREATE TABLE IF NOT EXISTS topics (
 );
 
 CREATE TABLE IF NOT EXISTS settings (
-    chat_id        INTEGER PRIMARY KEY,
-    antispam       INTEGER NOT NULL DEFAULT 1,
-    antiraid       INTEGER NOT NULL DEFAULT 1,
-    flood_limit    INTEGER NOT NULL DEFAULT 7,
-    flood_window   INTEGER NOT NULL DEFAULT 10,
-    mute_minutes   INTEGER NOT NULL DEFAULT 30
+    chat_id            INTEGER PRIMARY KEY,
+    antispam           INTEGER NOT NULL DEFAULT 1,
+    antiraid           INTEGER NOT NULL DEFAULT 1,
+    triggers_on        INTEGER NOT NULL DEFAULT 1,
+    flood_limit        INTEGER NOT NULL DEFAULT 7,
+    flood_window       INTEGER NOT NULL DEFAULT 10,
+    mute_minutes       INTEGER NOT NULL DEFAULT 30,
+    warn_limit         INTEGER NOT NULL DEFAULT 3,
+    auto_mute_min      INTEGER NOT NULL DEFAULT 60,
+    trig_mute_min      INTEGER NOT NULL DEFAULT 60,
+    default_mute_min   INTEGER NOT NULL DEFAULT 10
 );
 
 CREATE TABLE IF NOT EXISTS reports (
@@ -369,10 +379,23 @@ CREATE TABLE IF NOT EXISTS blacklist (
 );
 """
 
+SETTINGS_MIGRATIONS = [
+    ("triggers_on",      "INTEGER NOT NULL DEFAULT 1"),
+    ("warn_limit",       "INTEGER NOT NULL DEFAULT 3"),
+    ("auto_mute_sec",    "INTEGER NOT NULL DEFAULT 3600"),
+    ("trig_mute_sec",    "INTEGER NOT NULL DEFAULT 3600"),
+    ("default_mute_sec", "INTEGER NOT NULL DEFAULT 600"),
+    ("flood_mute_sec",   "INTEGER NOT NULL DEFAULT 1800"),
+]
+
 
 def _sync_init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.executescript(SCHEMA)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(settings)")}
+        for col, ddl in SETTINGS_MIGRATIONS:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE settings ADD COLUMN {col} {ddl}")
         conn.commit()
 
 
@@ -570,7 +593,15 @@ async def get_settings(chat_id: int):
     return row
 
 
-async def set_setting(chat_id: int, key: str, value: int):
+def _s(row, key, default):
+    try:
+        v = row[key]
+        return default if v is None else v
+    except (IndexError, KeyError):
+        return default
+
+
+async def set_setting(chat_id: int, key: str, value):
     await db_exec("INSERT OR IGNORE INTO settings (chat_id) VALUES (?)", (chat_id,))
     await db_exec(f"UPDATE settings SET {key}=? WHERE chat_id=?", (value, chat_id))
 
@@ -669,6 +700,33 @@ async def _deny_higher(msg, target_mention: str):
     )
 
 
+async def _mute_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
+    secs = max(1, int(secs))
+    try:
+        if secs >= MIN_TG_MUTE_SEC:
+            await bot.restrict_chat_member(
+                chat_id, user_id, MUTE_PERMS,
+                until_date=int(time.time()) + secs,
+            )
+        else:
+            await bot.restrict_chat_member(chat_id, user_id, MUTE_PERMS)
+            asyncio.create_task(_unmute_later(bot, chat_id, user_id, secs))
+        await set_mute(user_id, chat_id, None)
+        return True
+    except Exception as e:
+        log.debug("_mute_user fail: %s", e)
+        return False
+
+
+async def _unmute_later(bot, chat_id: int, user_id: int, secs: int):
+    await asyncio.sleep(secs)
+    try:
+        await bot.restrict_chat_member(chat_id, user_id, UNMUTE_PERMS)
+        await set_mute(user_id, chat_id, None)
+    except Exception as e:
+        log.debug("auto-unmute fail: %s", e)
+
+
 def mod_action(fn):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
@@ -759,24 +817,16 @@ async def antispam_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bucket.popleft()
 
     if len(bucket) >= settings["flood_limit"]:
-        minutes = settings["mute_minutes"]
-        try:
-            await ctx.bot.restrict_chat_member(
-                msg.chat.id, user.id, MUTE_PERMS,
-                until_date=int(time.time()) + minutes * 60,
-            )
-        except Exception as e:
-            log.debug("antispam restrict fail: %s", e)
-
-        await set_mute(user.id, msg.chat.id, None)
+        mute_sec = int(_s(settings, "flood_mute_sec", 1800))
+        await _mute_user(ctx.bot, msg.chat.id, user.id, mute_sec)
         note = await safe(
             ctx.bot.send_message, msg.chat.id,
-            f"🔇 {user.mention_html()} — мут за флуд на {minutes} мин.",
+            f"🔇 {user.mention_html()} — мут за флуд на {fmt_seconds(mute_sec)}.",
             parse_mode=ParseMode.HTML,
         )
         if note is not None:
             asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, EPHEMERAL_DELAY))
-        await log_action(ctx.bot, None, f"🔇 Авто-мут за флуд {minutes} мин", user, "", msg.chat.id)
+        await log_action(ctx.bot, None, f"🔇 Авто-мут за флуд {fmt_seconds(mute_sec)}", user, "", msg.chat.id)
         bucket.clear()
         raise ApplicationHandlerStop
 
@@ -821,6 +871,10 @@ async def trigger_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    settings = await get_settings(msg.chat.id)
+    if not settings or not settings["triggers_on"]:
+        return
+
     triggers = await list_triggers(msg.chat.id)
     if not triggers:
         return
@@ -836,35 +890,39 @@ async def trigger_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if word in text:
             action = row["action"]
             await safe(msg.delete)
-            await _apply_trigger(ctx.bot, msg.chat.id, user, action, word)
+            await _apply_trigger(ctx.bot, msg.chat.id, user, action, word, settings)
             raise ApplicationHandlerStop
 
 
-async def _apply_trigger(bot, chat_id: int, user, action: str, word: str):
+async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settings):
     uid = user.id
     mention = user.mention_html()
+    warn_limit = int(_s(settings, "warn_limit", 3))
+    trig_mute_sec = int(_s(settings, "trig_mute_sec", 3600))
+    auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
+
     if action == "warn":
         total = await add_warn(uid, chat_id)
         note = await safe(
             bot.send_message, chat_id,
-            f"⚠️ {mention} — предупреждение (триггер: <code>{esc(word)}</code>). Всего: {total}/3",
+            f"⚠️ {mention} — предупреждение (триггер: <code>{esc(word)}</code>). Всего: {total}/{warn_limit}",
             parse_mode=ParseMode.HTML,
         )
         if note is not None:
             asyncio.create_task(_del_later(bot, chat_id, note.message_id, EPHEMERAL_DELAY))
-        await log_action(bot, None, f"⚠️ Авто-варн (триггер: {word}) {total}/3", user, "", chat_id)
-        if total >= 3:
-            await _mute_member(bot, chat_id, uid, 60)
+        await log_action(bot, None, f"⚠️ Авто-варн (триггер: {word}) {total}/{warn_limit}", user, "", chat_id)
+        if total >= warn_limit:
+            await _mute_user(bot, chat_id, uid, auto_mute_sec)
             await reset_warns(uid, chat_id)
             note2 = await safe(bot.send_message, chat_id,
-                               f"🔇 {mention} — авто-мут на 1 час (3/3).",
+                               f"🔇 {mention} — авто-мут на {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}).",
                                parse_mode=ParseMode.HTML)
             if note2 is not None:
                 asyncio.create_task(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
-            await log_action(bot, None, "🔇 Авто-мут 1ч (3/3 варна)", user, "", chat_id)
+            await log_action(bot, None, f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit} варна)", user, "", chat_id)
     elif action == "mute":
-        await _mute_member(bot, chat_id, uid, 60)
-        await log_action(bot, None, f"🔇 Авто-мут (триггер: {word})", user, "", chat_id)
+        await _mute_user(bot, chat_id, uid, trig_mute_sec)
+        await log_action(bot, None, f"🔇 Авто-мут {fmt_seconds(trig_mute_sec)} (триггер: {word})", user, "", chat_id)
     elif action == "kick":
         try:
             await bot.ban_chat_member(chat_id, uid)
@@ -878,17 +936,6 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str):
             await log_action(bot, None, f"🔨 Авто-бан (триггер: {word})", user, "", chat_id)
         except Exception as e:
             log.debug("ban fail: %s", e)
-
-
-async def _mute_member(bot, chat_id: int, user_id: int, minutes: int):
-    try:
-        await bot.restrict_chat_member(
-            chat_id, user_id, MUTE_PERMS,
-            until_date=int(time.time()) + minutes * 60,
-        )
-        await set_mute(user_id, chat_id, None)
-    except Exception as e:
-        log.debug("mute fail: %s", e)
 
 
 async def antiraid_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1217,21 +1264,23 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     parts = (msg.text or "").split()
-    secs = parse_duration(parts[1]) if len(parts) > 1 else 600
+    if len(parts) > 1:
+        secs = parse_duration(parts[1])
+        if secs <= 0:
+            secs = parse_setting_time(parts[1])
+    else:
+        settings = await get_settings(msg.chat.id)
+        secs = int(_s(settings, "default_mute_sec", 600))
     if secs <= 0:
-        secs = 600
-    try:
-        await ctx.bot.restrict_chat_member(
-            msg.chat.id, t.id, MUTE_PERMS,
-            until_date=int(time.time()) + secs,
-        )
-        await set_mute(t.id, msg.chat.id, None)
+        settings = await get_settings(msg.chat.id)
+        secs = int(_s(settings, "default_mute_sec", 600))
+    ok = await _mute_user(ctx.bot, msg.chat.id, t.id, secs)
+    if ok:
         await log_action(ctx.bot, user, f"🔇 Мут на {fmt_seconds(secs)}", t, "", msg.chat.id)
-        await eph(msg,
-                  f"🔇 Готово: {t.mention_html()} замучен на {fmt_seconds(secs)}.",
+        await eph(msg, f"🔇 Готово: {t.mention_html()} замучен на {fmt_seconds(secs)}.",
                   parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await eph(msg, f"❌ Ошибка: {esc(e)}")
+    else:
+        await eph(msg, "❌ Не удалось замутить.")
 
 
 @mod_action
@@ -1270,22 +1319,20 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, "Ответь на сообщение."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
+    settings = await get_settings(msg.chat.id)
+    warn_limit = int(_s(settings, "warn_limit", 3))
+    auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
     total = await add_warn(t.id, msg.chat.id)
-    await log_action(ctx.bot, user, f"⚠️ Варн ({total}/3)", t, "", msg.chat.id)
-    await eph(msg, f"⚠️ Готово: {t.mention_html()} — предупреждение ({total}/3).",
+    await log_action(ctx.bot, user, f"⚠️ Варн ({total}/{warn_limit})", t, "", msg.chat.id)
+    await eph(msg, f"⚠️ Готово: {t.mention_html()} — предупреждение ({total}/{warn_limit}).",
               parse_mode=ParseMode.HTML)
-    if total >= 3:
-        try:
-            await ctx.bot.restrict_chat_member(
-                msg.chat.id, t.id, MUTE_PERMS,
-                until_date=int(time.time()) + 3600,
-            )
+    if total >= warn_limit:
+        ok = await _mute_user(ctx.bot, msg.chat.id, t.id, auto_mute_sec)
+        if ok:
             await reset_warns(t.id, msg.chat.id)
-            await log_action(ctx.bot, user, "🔇 Авто-мут 1ч (3/3)", t, "", msg.chat.id)
-            await eph(msg, f"🔇 {t.mention_html()} — авто-мут на 1 час (3/3).",
+            await log_action(ctx.bot, user, f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit})", t, "", msg.chat.id)
+            await eph(msg, f"🔇 {t.mention_html()} — авто-мут на {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}).",
                       parse_mode=ParseMode.HTML)
-        except Exception as e:
-            log.debug("auto-mute fail: %s", e)
 
 
 @mod_action
@@ -1312,10 +1359,12 @@ async def cmd_warns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None:
         return
+    settings = await get_settings(msg.chat.id)
+    warn_limit = int(_s(settings, "warn_limit", 3))
     t = await _target_user(msg) or user
     row = await get_user(t.id, msg.chat.id)
     warns = row["warns"] if row else 0
-    await eph(msg, f"⚠️ {t.mention_html()}: {warns}/3 предупреждений.",
+    await eph(msg, f"⚠️ {t.mention_html()}: {warns}/{warn_limit} предупреждений.",
               parse_mode=ParseMode.HTML)
 
 
@@ -1365,6 +1414,11 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await safe(q.answer, "⛔ Его ранг не ниже твоего.", show_alert=True)
             return
 
+    settings = await get_settings(chat_id)
+    warn_limit = int(_s(settings, "warn_limit", 3))
+    auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
+    default_mute_sec = int(_s(settings, "default_mute_sec", 600))
+
     try:
         member = await ctx.bot.get_chat_member(chat_id, target_id)
         mention = member.user.mention_html()
@@ -1377,34 +1431,26 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "warn":
         total = await add_warn(target_id, chat_id)
-        await log_action(ctx.bot, q.from_user, f"⚠️ Варн ({total}/3) [кнопка]",
+        await log_action(ctx.bot, q.from_user, f"⚠️ Варн ({total}/{warn_limit}) [кнопка]",
                          target_user_obj or target_id, "", chat_id)
-        result = f"⚠️ {mention} — варн ({total}/3)"
-        if total >= 3:
-            try:
-                await ctx.bot.restrict_chat_member(
-                    chat_id, target_id, MUTE_PERMS,
-                    until_date=int(time.time()) + 3600,
-                )
+        result = f"⚠️ {mention} — варн ({total}/{warn_limit})"
+        if total >= warn_limit:
+            ok = await _mute_user(ctx.bot, chat_id, target_id, auto_mute_sec)
+            if ok:
                 await reset_warns(target_id, chat_id)
-                await log_action(ctx.bot, q.from_user, "🔇 Авто-мут 1ч (3/3) [кнопка]",
+                await log_action(ctx.bot, q.from_user,
+                                 f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}) [кнопка]",
                                  target_user_obj or target_id, "", chat_id)
-                result += " → 🔇 авто-мут 1ч"
-            except Exception as e:
-                result += f" (мут не удался: {esc(e)})"
+                result += f" → 🔇 авто-мут {fmt_seconds(auto_mute_sec)}"
 
     elif action == "mute":
-        try:
-            await ctx.bot.restrict_chat_member(
-                chat_id, target_id, MUTE_PERMS,
-                until_date=int(time.time()) + 1800,
-            )
-            await set_mute(target_id, chat_id, None)
-            await log_action(ctx.bot, q.from_user, "🔇 Мут 30м [кнопка]",
+        ok = await _mute_user(ctx.bot, chat_id, target_id, default_mute_sec)
+        if ok:
+            await log_action(ctx.bot, q.from_user, f"🔇 Мут {fmt_seconds(default_mute_sec)} [кнопка]",
                              target_user_obj or target_id, "", chat_id)
-            result = f"🔇 {mention} — мут 30 мин"
-        except Exception as e:
-            result = f"❌ мут: {esc(e)}"
+            result = f"🔇 {mention} — мут {fmt_seconds(default_mute_sec)}"
+        else:
+            result = "❌ мут не удался"
 
     elif action == "kick":
         try:
@@ -1458,18 +1504,24 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         rank_val = await resolve_rank(ctx.bot, chat_id, target_id)
         circles = await circles_of_user(chat_id, target_id)
         circle_names = ", ".join(c["name"] for c in circles) if circles else "—"
+        target_chat = q.message.chat.id
+        target_thread = q.message.message_thread_id or 0
+        send_kwargs = {}
+        if target_thread:
+            send_kwargs["message_thread_id"] = target_thread
         note = await safe(
-            ctx.bot.send_message, chat_id,
+            ctx.bot.send_message, target_chat,
             f"👤 <b>Профиль</b>\n"
             f"{mention}\n"
             f"ID: <code>{target_id}</code>\n"
             f"Ранг: {RANK_NAMES.get(rank_val, '—')}\n"
-            f"⚠ Варны: {warns}/3\n"
+            f"⚠ Варны: {warns}/{warn_limit}\n"
             f"👥 Кружки: {circle_names}",
             parse_mode=ParseMode.HTML,
+            **send_kwargs,
         )
         if note is not None:
-            asyncio.create_task(_del_later(ctx.bot, chat_id, note.message_id, 15.0))
+            asyncio.create_task(_del_later(ctx.bot, target_chat, note.message_id, 30.0))
         await safe(q.answer, "Профиль отправлен")
         return
 
@@ -1564,11 +1616,10 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     cid = await create_circle(msg.chat.id, name, user.id, thread_id)
     await add_circle_member(cid, user.id)
-    await safe(msg.reply_text,
-               f"✅ Кружок <b>{esc(name)}</b> создан.\n"
-               f"Вступить: <code>/join {esc(name)}</code>",
-               parse_mode=ParseMode.HTML)
-    await safe(ctx.bot.delete_message, msg.chat.id, msg.message_id)
+    await eph(msg,
+              f"✅ Кружок <b>{esc(name)}</b> создан.\n"
+              f"Вступить: <code>/join {esc(name)}</code>",
+              parse_mode=ParseMode.HTML)
 
 
 async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1694,12 +1745,12 @@ async def cmd_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     parts = (msg.text or "").split()
     arg = parts[1].lower() if len(parts) > 1 else ""
-    if arg not in ("on", "off"):
+    if arg not in ("on", "off", "вкл", "выкл"):
         await eph(msg, "Использование: <code>/links on</code> или <code>/links off</code>",
                   parse_mode=ParseMode.HTML); return
 
     thread_id = msg.message_thread_id or 0
-    allowed = (arg == "on")
+    allowed = arg in ("on", "вкл")
     await set_topic_links(msg.chat.id, thread_id, allowed)
     await log_action(ctx.bot, user, f"🔗 Ссылки: {'on' if allowed else 'off'}", "—", "", msg.chat.id)
     await eph(msg,
@@ -1767,12 +1818,14 @@ async def _build_profile(ctx, chat_id: int, target) -> str:
     rank_val = await resolve_rank(ctx.bot, chat_id, target.id)
     circles = await circles_of_user(chat_id, target.id)
     circle_names = ", ".join(c["name"] for c in circles) if circles else "—"
+    settings = await get_settings(chat_id)
+    warn_limit = int(_s(settings, "warn_limit", 3))
     lines = [
         "👤 <b>Профиль</b>",
         f"Имя: {target.mention_html()}",
         f"ID: <code>{target.id}</code>",
         f"Ранг: <b>{RANK_NAMES.get(rank_val, '—')}</b>",
-        f"⚠ Предупреждений: <b>{warns}/3</b>",
+        f"⚠ Предупреждений: <b>{warns}/{warn_limit}</b>",
         f"👥 Кружки: {circle_names}",
     ]
     if row and row["mute_until"]:
@@ -1811,6 +1864,50 @@ async def cmd_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                parse_mode=ParseMode.HTML)
 
 
+SETTING_ALIASES = {
+    "antispam":     "antispam",
+    "антиспам":     "antispam",
+    "antiraid":     "antiraid",
+    "антирейд":     "antiraid",
+    "triggers":     "triggers_on",
+    "триггеры":     "triggers_on",
+    "floodmute":    "flood_mute_sec",
+    "мутфлуд":      "flood_mute_sec",
+    "warnlimit":    "warn_limit",
+    "варнлимит":    "warn_limit",
+    "automute":     "auto_mute_sec",
+    "автомут":      "auto_mute_sec",
+    "triggermute":  "trig_mute_sec",
+    "триггермут":   "trig_mute_sec",
+    "defmute":      "default_mute_sec",
+    "дефмут":       "default_mute_sec",
+}
+
+BOOL_SETTINGS = {"antispam", "antiraid", "triggers_on"}
+
+TIME_SETTINGS = {"flood_mute_sec", "auto_mute_sec", "trig_mute_sec", "default_mute_sec"}
+
+
+def _settings_help() -> str:
+    return (
+        "<b>Управление настройками</b>\n\n"
+        "<b>Время пишется так:</b> <code>10s</code> · <code>30m</code> · <code>1h</code> · <code>2d</code>\n"
+        "(s=секунды, m=минуты, h=часы, d=дни). Без буквы — секунды.\n\n"
+        "<b>Тумблеры (вкл/выкл):</b>\n"
+        "• <code>/settings antispam on|off</code> · <code>настройки антиспам вкл|выкл</code>\n"
+        "• <code>/settings antiraid on|off</code> · <code>настройки антирейд вкл|выкл</code>\n"
+        "• <code>/settings triggers on|off</code> · <code>настройки триггеры вкл|выкл</code>\n\n"
+        "<b>Числа:</b>\n"
+        "• <code>/settings warnlimit N</code> · <code>настройки варнлимит N</code>\n"
+        "• <code>/settings flood N время</code> · <code>настройки флуд N 10s</code>\n\n"
+        "<b>Время:</b>\n"
+        "• <code>/settings floodmute 30m</code> · <code>настройки мутфлуд 30m</code>\n"
+        "• <code>/settings automute 1h</code> · <code>настройки автомут 1h</code>\n"
+        "• <code>/settings triggermute 1h</code> · <code>настройки триггермут 1h</code>\n"
+        "• <code>/settings defmute 10m</code> · <code>настройки дефмут 10m</code>\n"
+    )
+
+
 @mod_action
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -1819,47 +1916,103 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
     if my_rank < RANK_SENIOR_ADMIN:
         await _rank_error(update, RANK_SENIOR_ADMIN, my_rank); return
+
     parts = (msg.text or "").split()
 
     if len(parts) == 1:
         s = await get_settings(msg.chat.id)
-        await eph(
-            msg,
-            f"<b>Настройки чата</b>\n"
-            f"Антиспам: <b>{'вкл' if s['antispam'] else 'выкл'}</b>\n"
-            f"Антирейд: <b>{'вкл' if s['antiraid'] else 'выкл'}</b>\n"
-            f"Лимит флуда: <b>{s['flood_limit']}</b> сообщений за <b>{s['flood_window']}</b> сек\n"
-            f"Мут за флуд: <b>{s['mute_minutes']}</b> мин\n\n"
-            f"<code>/settings antispam on|off</code>\n"
-            f"<code>/settings antiraid on|off</code>\n"
-            f"<code>/settings flood &lt;N&gt; &lt;сек&gt;</code>\n"
-            f"<code>/settings mute &lt;мин&gt;</code>",
-            parse_mode=ParseMode.HTML,
+        cur = (
+            f"<b>Текущие настройки</b>\n"
+            f"🔹 Антиспам: <b>{'вкл' if s['antispam'] else 'выкл'}</b>\n"
+            f"🔹 Антирейд: <b>{'вкл' if s['antiraid'] else 'выкл'}</b>\n"
+            f"🔹 Триггеры: <b>{'вкл' if s['triggers_on'] else 'выкл'}</b>\n"
+            f"🔹 Флуд: <b>{s['flood_limit']}</b> сообщ. / <b>{fmt_seconds(int(s['flood_window']))}</b>\n"
+            f"🔹 Мут за флуд: <b>{fmt_seconds(int(_s(s, 'flood_mute_sec', 1800)))}</b>\n"
+            f"🔹 Варнов до авто-мута: <b>{_s(s, 'warn_limit', 3)}</b>\n"
+            f"🔹 Авто-мут: <b>{fmt_seconds(int(_s(s, 'auto_mute_sec', 3600)))}</b>\n"
+            f"🔹 Мут по триггеру: <b>{fmt_seconds(int(_s(s, 'trig_mute_sec', 3600)))}</b>\n"
+            f"🔹 Мут по умолчанию: <b>{fmt_seconds(int(_s(s, 'default_mute_sec', 600)))}</b>\n\n"
+            + _settings_help()
         )
+        await eph(msg, cur, parse_mode=ParseMode.HTML, delay=60.0)
         return
 
-    key = parts[1].lower()
-    if key in ("antispam", "antiraid") and len(parts) > 2:
-        val = 1 if parts[2].lower() in ("on", "1", "вкл") else 0
-        await set_setting(msg.chat.id, key, val)
-        await eph(msg, f"✅ {key} → {'вкл' if val else 'выкл'}")
-    elif key == "flood" and len(parts) > 3:
+    key_raw = parts[1].lower()
+
+    if key_raw in ("flood", "флуд"):
+        if len(parts) < 4:
+            await eph(msg, "Использование: <code>/settings flood N 10s</code>",
+                      parse_mode=ParseMode.HTML); return
         try:
-            n, w = int(parts[2]), int(parts[3])
+            n = int(parts[2])
         except ValueError:
-            await eph(msg, "Числа нужны."); return
+            await eph(msg, "Первое значение — число сообщений."); return
+        w = parse_setting_time(parts[3])
+        if n <= 0 or w <= 0:
+            await eph(msg, "Оба значения должны быть > 0."); return
         await set_setting(msg.chat.id, "flood_limit", n)
         await set_setting(msg.chat.id, "flood_window", w)
-        await eph(msg, f"✅ flood → {n}/{w}с")
-    elif key == "mute" and len(parts) > 2:
-        try:
-            m = int(parts[2])
-        except ValueError:
-            await eph(msg, "Число нужно."); return
-        await set_setting(msg.chat.id, "mute_minutes", m)
-        await eph(msg, f"✅ mute → {m} мин")
-    else:
-        await eph(msg, "См. /settings")
+        await log_action(ctx.bot, user, f"⚙️ flood → {n} за {fmt_seconds(w)}", "—", "", msg.chat.id)
+        await eph(msg,
+                  f"✅ Флуд-лимит: <b>{n}</b> сообщ. за <b>{fmt_seconds(w)}</b>",
+                  parse_mode=ParseMode.HTML)
+        return
+
+    if key_raw not in SETTING_ALIASES:
+        await eph(msg, _settings_help(), parse_mode=ParseMode.HTML, delay=60.0)
+        return
+
+    key = SETTING_ALIASES[key_raw]
+
+    if key in BOOL_SETTINGS:
+        if len(parts) < 3:
+            await eph(msg, f"Использование: <code>/settings {key_raw} on|off</code>",
+                      parse_mode=ParseMode.HTML); return
+        raw = parts[2].lower()
+        if raw in ("on", "1", "вкл", "да", "yes", "true"):
+            val = 1
+        elif raw in ("off", "0", "выкл", "нет", "no", "false"):
+            val = 0
+        else:
+            await eph(msg, "Значение: on/off · вкл/выкл"); return
+        await set_setting(msg.chat.id, key, val)
+        await log_action(ctx.bot, user, f"⚙️ {key} → {'вкл' if val else 'выкл'}", "—", "", msg.chat.id)
+        await eph(msg, f"✅ {key} → <b>{'вкл' if val else 'выкл'}</b>",
+                  parse_mode=ParseMode.HTML)
+        return
+
+    if len(parts) < 3:
+        if key in TIME_SETTINGS:
+            await eph(msg, f"Использование: <code>/settings {key_raw} 30m</code>\n"
+                          f"Формат: 10s / 30m / 1h / 2d",
+                      parse_mode=ParseMode.HTML)
+        else:
+            await eph(msg, f"Использование: <code>/settings {key_raw} N</code>",
+                      parse_mode=ParseMode.HTML)
+        return
+
+    if key in TIME_SETTINGS:
+        secs = parse_setting_time(parts[2])
+        if secs <= 0:
+            await eph(msg, "Не понял время. Пример: <code>10s</code> · <code>30m</code> · <code>1h</code> · <code>2d</code>",
+                      parse_mode=ParseMode.HTML)
+            return
+        await set_setting(msg.chat.id, key, secs)
+        await log_action(ctx.bot, user, f"⚙️ {key} → {fmt_seconds(secs)}", "—", "", msg.chat.id)
+        await eph(msg, f"✅ {key_raw} → <b>{fmt_seconds(secs)}</b> ({secs} сек)",
+                  parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        val = int(parts[2])
+    except ValueError:
+        await eph(msg, "Число нужно."); return
+    if val < 0:
+        await eph(msg, "Число не может быть отрицательным."); return
+
+    await set_setting(msg.chat.id, key, val)
+    await log_action(ctx.bot, user, f"⚙️ {key} → {val}", "—", "", msg.chat.id)
+    await eph(msg, f"✅ {key_raw} → <b>{val}</b>", parse_mode=ParseMode.HTML)
 
 
 async def _post_init(app: Application):
@@ -1870,6 +2023,7 @@ async def _post_init(app: Application):
             BotCommand("report", "Жалоба (реплай)"),
             BotCommand("me", "Мой профиль"),
             BotCommand("profile", "Профиль участника"),
+            BotCommand("settings", "Настройки авто-действий"),
         ])
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
