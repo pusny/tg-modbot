@@ -2162,7 +2162,7 @@ async def _build_app() -> Application:
 
     for pattern, handler in RU_ALIASES:
         app.add_handler(MessageHandler(
-            G & filters.TEXT & filters.Regex(pattern, flags=re.IGNORECASE),
+            G & filters.TEXT & filters.Regex(re.compile(pattern, re.IGNORECASE)),
             handler,
         ))
 
