@@ -201,6 +201,18 @@ def _msg_link(chat_id: int, message_id: Optional[int]) -> str:
     return ""
 
 
+_pending_tasks: set = set()
+
+
+def _schedule(coro):
+    try:
+        task = asyncio.create_task(coro)
+        _pending_tasks.add(task)
+        task.add_done_callback(_pending_tasks.discard)
+    except Exception as e:
+        log.debug("_schedule fail: %s", e)
+
+
 async def safe(coro_fn, *args, retries: int = 3, **kwargs):
     for attempt in range(1, retries + 1):
         try:
@@ -222,15 +234,23 @@ async def _del_later(bot, chat_id: int, message_id: int, delay: float):
 
 async def eph(msg, text: str, delay: float = EPHEMERAL_DELAY, bot=None, **kwargs):
     sent = await safe(msg.reply_text, text, **kwargs)
-    if sent is not None and delay > 0:
-        actual_bot = bot
-        if actual_bot is None:
-            try:
-                actual_bot = await msg.get_bot()
-            except Exception:
-                actual_bot = None
-        if actual_bot is not None:
-            asyncio.create_task(_del_later(actual_bot, msg.chat.id, sent.message_id, delay))
+    if sent is None or delay <= 0:
+        return sent
+    actual_bot = bot
+    if actual_bot is None:
+        try:
+            gb = getattr(msg, "get_bot", None)
+            if gb is not None:
+                maybe = gb()
+                if asyncio.iscoroutine(maybe):
+                    actual_bot = await maybe
+                else:
+                    actual_bot = maybe
+        except Exception as e:
+            log.debug("eph get_bot fail: %s", e)
+            actual_bot = None
+    if actual_bot is not None:
+        _schedule(_del_later(actual_bot, msg.chat.id, sent.message_id, delay))
     return sent
 
 
@@ -414,6 +434,7 @@ SETTINGS_MIGRATIONS = [
     ("trig_mute_sec",    "INTEGER NOT NULL DEFAULT 3600"),
     ("default_mute_sec", "INTEGER NOT NULL DEFAULT 600"),
     ("flood_mute_sec",   "INTEGER NOT NULL DEFAULT 1800"),
+    ("warn_action",      "TEXT NOT NULL DEFAULT 'ban'"),
 ]
 
 
@@ -738,7 +759,7 @@ async def _mute_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
             )
         else:
             await bot.restrict_chat_member(chat_id, user_id, MUTE_PERMS)
-            asyncio.create_task(_unmute_later(bot, chat_id, user_id, secs))
+            _schedule(_unmute_later(bot, chat_id, user_id, secs))
         await set_mute(user_id, chat_id, None)
         return True
     except Exception as e:
@@ -762,7 +783,7 @@ def mod_action(fn):
             await fn(update, ctx)
         finally:
             if msg is not None and msg.chat.type != "private":
-                asyncio.create_task(
+                _schedule(
                     _del_later(ctx.bot, msg.chat.id, msg.message_id, EPHEMERAL_DELAY)
                 )
     return wrapper
@@ -936,20 +957,49 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
             parse_mode=ParseMode.HTML,
         )
         if note is not None:
-            asyncio.create_task(_del_later(bot, chat_id, note.message_id, EPHEMERAL_DELAY))
+            _schedule(_del_later(bot, chat_id, note.message_id, EPHEMERAL_DELAY))
         await log_action(bot, None, f"⚠️ Авто-варн (триггер: {word}) {total}/{warn_limit}",
                          user, "", chat_id)
         if total >= warn_limit:
-            await _mute_user(bot, chat_id, uid, auto_mute_sec)
-            await reset_warns(uid, chat_id)
-            note2 = await safe(bot.send_message, chat_id,
-                               f"🔇 {mention} — авто-мут на {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}).",
-                               parse_mode=ParseMode.HTML)
-            if note2 is not None:
-                asyncio.create_task(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
-            await log_action(bot, None,
-                             f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit} варна)",
-                             user, "", chat_id)
+            warn_action = str(_s(settings, "warn_action", "ban")).lower()
+            try:
+                if warn_action == "ban":
+                    await bot.ban_chat_member(chat_id, uid)
+                    await add_blacklist(uid, chat_id, "auto_ban_warns")
+                    await reset_warns(uid, chat_id)
+                    note2 = await safe(bot.send_message, chat_id,
+                                       f"🔨 {mention} — забанен ({warn_limit}/{warn_limit} варнов).",
+                                       parse_mode=ParseMode.HTML)
+                    if note2 is not None:
+                        _schedule(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
+                    await log_action(bot, None,
+                                     f"🔨 Авто-бан ({warn_limit}/{warn_limit} варнов по триггеру)",
+                                     user, "", chat_id)
+                elif warn_action == "kick":
+                    await bot.ban_chat_member(chat_id, uid)
+                    await bot.unban_chat_member(chat_id, uid)
+                    await reset_warns(uid, chat_id)
+                    note2 = await safe(bot.send_message, chat_id,
+                                       f"👢 {mention} — кикнут ({warn_limit}/{warn_limit} варнов).",
+                                       parse_mode=ParseMode.HTML)
+                    if note2 is not None:
+                        _schedule(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
+                    await log_action(bot, None,
+                                     f"👢 Авто-кик ({warn_limit}/{warn_limit} варнов по триггеру)",
+                                     user, "", chat_id)
+                else:
+                    await _mute_user(bot, chat_id, uid, auto_mute_sec)
+                    await reset_warns(uid, chat_id)
+                    note2 = await safe(bot.send_message, chat_id,
+                                       f"🔇 {mention} — авто-мут на {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}).",
+                                       parse_mode=ParseMode.HTML)
+                    if note2 is not None:
+                        _schedule(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
+                    await log_action(bot, None,
+                                     f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit} варна)",
+                                     user, "", chat_id)
+            except Exception as e:
+                log.debug("auto-warn-action fail (trigger): %s", e)
     elif action == "mute":
         await _mute_user(bot, chat_id, uid, trig_mute_sec)
         await log_action(bot, None, f"🔇 Авто-мут {fmt_seconds(trig_mute_sec)} (триггер: {word})",
@@ -1477,14 +1527,37 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await eph(msg, f"⚠️ Готово: {t.mention_html()} — предупреждение ({total}/{warn_limit}).",
               parse_mode=ParseMode.HTML)
     if total >= warn_limit:
-        ok = await _mute_user(ctx.bot, msg.chat.id, t.id, auto_mute_sec)
-        if ok:
-            await reset_warns(t.id, msg.chat.id)
-            await log_action(ctx.bot, user,
-                             f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit})",
-                             t, "", msg.chat.id, reply_msg_id=reply_id)
-            await eph(msg, f"🔇 {t.mention_html()} — авто-мут на {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}).",
-                      parse_mode=ParseMode.HTML)
+        warn_action = str(_s(settings, "warn_action", "ban")).lower()
+        try:
+            if warn_action == "ban":
+                await ctx.bot.ban_chat_member(msg.chat.id, t.id)
+                await add_blacklist(t.id, msg.chat.id, "auto_ban_warns")
+                await reset_warns(t.id, msg.chat.id)
+                await log_action(ctx.bot, user,
+                                 f"🔨 Авто-бан ({warn_limit}/{warn_limit} варнов)",
+                                 t, "", msg.chat.id, reply_msg_id=reply_id)
+                await eph(msg, f"🔨 {t.mention_html()} — забанен ({warn_limit}/{warn_limit} варнов).",
+                          parse_mode=ParseMode.HTML)
+            elif warn_action == "kick":
+                await ctx.bot.ban_chat_member(msg.chat.id, t.id)
+                await ctx.bot.unban_chat_member(msg.chat.id, t.id)
+                await reset_warns(t.id, msg.chat.id)
+                await log_action(ctx.bot, user,
+                                 f"👢 Авто-кик ({warn_limit}/{warn_limit} варнов)",
+                                 t, "", msg.chat.id, reply_msg_id=reply_id)
+                await eph(msg, f"👢 {t.mention_html()} — кикнут ({warn_limit}/{warn_limit} варнов).",
+                          parse_mode=ParseMode.HTML)
+            else:
+                ok = await _mute_user(ctx.bot, msg.chat.id, t.id, auto_mute_sec)
+                if ok:
+                    await reset_warns(t.id, msg.chat.id)
+                    await log_action(ctx.bot, user,
+                                     f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit})",
+                                     t, "", msg.chat.id, reply_msg_id=reply_id)
+                    await eph(msg, f"🔇 {t.mention_html()} — авто-мут на {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}).",
+                              parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.debug("auto-warn-action fail: %s", e)
 
 
 @mod_action
@@ -1540,7 +1613,7 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=mod_kb(msg.chat.id, t.id),
     )
     if sent is not None:
-        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, sent.message_id, EPHEMERAL_DELAY))
+        _schedule(_del_later(ctx.bot, msg.chat.id, sent.message_id, EPHEMERAL_DELAY))
 
 
 async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1588,13 +1661,34 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                          target_user_obj or target_id, "", chat_id)
         result = f"⚠️ {mention} — варн ({total}/{warn_limit})"
         if total >= warn_limit:
-            ok = await _mute_user(ctx.bot, chat_id, target_id, auto_mute_sec)
-            if ok:
-                await reset_warns(target_id, chat_id)
-                await log_action(ctx.bot, q.from_user,
-                                 f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}) [кнопка]",
-                                 target_user_obj or target_id, "", chat_id)
-                result += f" → 🔇 авто-мут {fmt_seconds(auto_mute_sec)}"
+            warn_action = str(_s(settings, "warn_action", "ban")).lower()
+            try:
+                if warn_action == "ban":
+                    await ctx.bot.ban_chat_member(chat_id, target_id)
+                    await add_blacklist(target_id, chat_id, "auto_ban_warns")
+                    await reset_warns(target_id, chat_id)
+                    await log_action(ctx.bot, q.from_user,
+                                     f"🔨 Авто-бан ({warn_limit}/{warn_limit} варнов) [кнопка]",
+                                     target_user_obj or target_id, "", chat_id)
+                    result += " → 🔨 авто-бан"
+                elif warn_action == "kick":
+                    await ctx.bot.ban_chat_member(chat_id, target_id)
+                    await ctx.bot.unban_chat_member(chat_id, target_id)
+                    await reset_warns(target_id, chat_id)
+                    await log_action(ctx.bot, q.from_user,
+                                     f"👢 Авто-кик ({warn_limit}/{warn_limit} варнов) [кнопка]",
+                                     target_user_obj or target_id, "", chat_id)
+                    result += " → 👢 авто-кик"
+                else:
+                    ok = await _mute_user(ctx.bot, chat_id, target_id, auto_mute_sec)
+                    if ok:
+                        await reset_warns(target_id, chat_id)
+                        await log_action(ctx.bot, q.from_user,
+                                         f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}) [кнопка]",
+                                         target_user_obj or target_id, "", chat_id)
+                        result += f" → 🔇 авто-мут {fmt_seconds(auto_mute_sec)}"
+            except Exception as e:
+                result += f" (ошибка: {esc(e)})"
 
     elif action == "mute":
         ok = await _mute_user(ctx.bot, chat_id, target_id, default_mute_sec)
@@ -1674,7 +1768,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             **send_kwargs,
         )
         if note is not None:
-            asyncio.create_task(_del_later(ctx.bot, target_chat, note.message_id, EPHEMERAL_DELAY))
+            _schedule(_del_later(ctx.bot, target_chat, note.message_id, EPHEMERAL_DELAY))
         await safe(q.answer, "Профиль отправлен")
         return
 
@@ -1691,7 +1785,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     note = await safe(q.message.reply_text, result, parse_mode=ParseMode.HTML)
     if note is not None:
-        asyncio.create_task(_del_later(ctx.bot, note.chat.id, note.message_id, EPHEMERAL_DELAY))
+        _schedule(_del_later(ctx.bot, note.chat.id, note.message_id, EPHEMERAL_DELAY))
     await safe(q.answer, "Готово")
 
 
@@ -1898,7 +1992,7 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         **note_kwargs,
     )
     if note is not None:
-        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, EPHEMERAL_DELAY))
+        _schedule(_del_later(ctx.bot, msg.chat.id, note.message_id, EPHEMERAL_DELAY))
 
 
 @mod_action
@@ -2047,11 +2141,18 @@ SETTING_ALIASES = {
     "триггермут":   "trig_mute_sec",
     "defmute":      "default_mute_sec",
     "дефмут":       "default_mute_sec",
+    "warnaction":   "warn_action",
+    "варндействие": "warn_action",
+    "варнэкшн":     "warn_action",
 }
 
 BOOL_SETTINGS = {"antispam", "antiraid", "triggers_on"}
 
 TIME_SETTINGS = {"flood_mute_sec", "auto_mute_sec", "trig_mute_sec", "default_mute_sec"}
+
+CHOICE_SETTINGS = {
+    "warn_action": ("mute", "ban", "kick"),
+}
 
 
 def _settings_help() -> str:
@@ -2064,13 +2165,17 @@ def _settings_help() -> str:
         "• <code>/settings антирейд вкл|выкл</code>\n"
         "• <code>/settings триггеры вкл|выкл</code>\n\n"
         "<b>Числа:</b>\n"
-        "• <code>/settings варнлимит N</code> — варнов до авто-мута\n"
+        "• <code>/settings варнлимит N</code> — варнов до авто-наказания\n"
         "• <code>/settings флуд N 10с</code> — N сообщений за время\n\n"
         "<b>Время:</b>\n"
         "• <code>/settings мутфлуд 30м</code> — мут за флуд\n"
-        "• <code>/settings автомут 1ч</code> — авто-мут при N варнов\n"
+        "• <code>/settings автомут 1ч</code> — длительность авто-мута\n"
         "• <code>/settings триггермут 1ч</code> — мут по триггеру\n"
-        "• <code>/settings дефмут 10м</code> — мут /mute без времени\n"
+        "• <code>/settings дефмут 10м</code> — мут /mute без времени\n\n"
+        "<b>Действие при N варнах:</b>\n"
+        "• <code>/settings варндействие mute</code> — мут на автомут-время\n"
+        "• <code>/settings варндействие ban</code> — бан (по умолчанию)\n"
+        "• <code>/settings варндействие kick</code> — кик\n"
     )
 
 
@@ -2094,7 +2199,8 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔹 Триггеры: <b>{'вкл' if s['triggers_on'] else 'выкл'}</b>\n"
             f"🔹 Флуд: <b>{s['flood_limit']}</b> сообщ. / <b>{fmt_seconds(int(s['flood_window']))}</b>\n"
             f"🔹 Мут за флуд: <b>{fmt_seconds(int(_s(s, 'flood_mute_sec', 1800)))}</b>\n"
-            f"🔹 Варнов до авто-мута: <b>{_s(s, 'warn_limit', 3)}</b>\n"
+            f"🔹 Варнов до авто-наказания: <b>{_s(s, 'warn_limit', 3)}</b>\n"
+            f"🔹 Действие при N варнах: <b>{_s(s, 'warn_action', 'ban')}</b>\n"
             f"🔹 Авто-мут: <b>{fmt_seconds(int(_s(s, 'auto_mute_sec', 3600)))}</b>\n"
             f"🔹 Мут по триггеру: <b>{fmt_seconds(int(_s(s, 'trig_mute_sec', 3600)))}</b>\n"
             f"🔹 Мут по умолчанию: <b>{fmt_seconds(int(_s(s, 'default_mute_sec', 600)))}</b>\n\n"
@@ -2132,6 +2238,20 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     key = SETTING_ALIASES[key_raw]
+
+    if key in CHOICE_SETTINGS:
+        variants = CHOICE_SETTINGS[key]
+        if len(parts) < 3:
+            await eph(msg, f"❌ Использование: <code>/settings {key_raw} {'|'.join(variants)}</code>",
+                      parse_mode=ParseMode.HTML); return
+        val = parts[2].lower()
+        if val not in variants:
+            await eph(msg, f"❌ Значение должно быть: <b>{' · '.join(variants)}</b>",
+                      parse_mode=ParseMode.HTML); return
+        await set_setting(msg.chat.id, key, val)
+        await log_action(ctx.bot, user, f"⚙️ {key} → {val}", "—", "", msg.chat.id)
+        await eph(msg, f"✅ {key_raw} → <b>{val}</b>", parse_mode=ParseMode.HTML)
+        return
 
     if key in BOOL_SETTINGS:
         if len(parts) < 3:
