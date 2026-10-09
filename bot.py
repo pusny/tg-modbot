@@ -49,6 +49,8 @@ def _req_int(key: str, default: Optional[int] = None) -> int:
 
 BOT_TOKEN        = _req("BOT_TOKEN")
 ADMIN_CHAT_ID    = _req_int("ADMIN_CHAT_ID")
+ADMIN_THREAD_ID  = _req_int("ADMIN_THREAD_ID", 0) or None
+REPORT_CHAT_ID   = _req_int("REPORT_CHAT_ID")
 REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
 DB_PATH          = os.getenv("DB_PATH", "bot.db")
 
@@ -97,8 +99,8 @@ if not log.handlers:
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-log.info("Config loaded | cwd=%s | admin=%s | thread=%s",
-         Path.cwd(), ADMIN_CHAT_ID, REPORT_THREAD_ID)
+log.info("Config loaded | cwd=%s | admin=%s | admin_thread=%s | report_chat=%s | report_thread=%s",
+         Path.cwd(), ADMIN_CHAT_ID, ADMIN_THREAD_ID, REPORT_CHAT_ID, REPORT_THREAD_ID)
 
 
 RANK_OWNER        = 100
@@ -218,7 +220,6 @@ async def _del_later(bot, chat_id: int, message_id: int, delay: float):
 
 
 async def _delayed(bot, chat_id: int, message_id: int):
-    """Планирует автоудаление сообщения через ephemeral_delay этого чата."""
     try:
         s = await get_settings(chat_id)
         delay = int(_s(s, "ephemeral_delay", int(DEFAULT_EPHEMERAL_DELAY)))
@@ -232,9 +233,6 @@ async def eph(msg, text: str, delay: Optional[float] = None, bot=None, **kwargs)
     sent = await safe(msg.reply_text, text, **kwargs)
     if sent is None:
         return sent
-    if delay is None:
-        await _delayed(bot or msg.bot if False else (bot or msg.chat.id and bot), msg.chat.id, sent.message_id) if False else None
-    # упрощаем: если bot не передан — попробуем вытащить через get_bot
     actual_bot = bot
     if actual_bot is None:
         try:
@@ -258,14 +256,27 @@ async def eph(msg, text: str, delay: Optional[float] = None, bot=None, **kwargs)
 
 async def send_admin(bot, text: str, **kwargs):
     kw = dict(kwargs)
-    if REPORT_THREAD_ID:
-        kw["message_thread_id"] = REPORT_THREAD_ID
+    if ADMIN_THREAD_ID:
+        kw["message_thread_id"] = ADMIN_THREAD_ID
     sent = await safe(bot.send_message, ADMIN_CHAT_ID, text, **kw)
-    if sent is None and REPORT_THREAD_ID:
+    if sent is None and ADMIN_THREAD_ID:
         kw.pop("message_thread_id", None)
         sent = await safe(bot.send_message, ADMIN_CHAT_ID, text, **kw)
     if sent is None:
         log.warning("send_admin: не удалось доставить лог в %s", ADMIN_CHAT_ID)
+    return sent
+
+
+async def send_report(bot, text: str, **kwargs):
+    kw = dict(kwargs)
+    if REPORT_THREAD_ID:
+        kw["message_thread_id"] = REPORT_THREAD_ID
+    sent = await safe(bot.send_message, REPORT_CHAT_ID, text, **kw)
+    if sent is None and REPORT_THREAD_ID:
+        kw.pop("message_thread_id", None)
+        sent = await safe(bot.send_message, REPORT_CHAT_ID, text, **kw)
+    if sent is None:
+        log.warning("send_report: не удалось доставить репорт в %s", REPORT_CHAT_ID)
     return sent
 
 
@@ -766,9 +777,8 @@ async def _deny_higher(msg, target_mention: str, target_rank: int = -1):
 async def _no_target(msg):
     await eph(
         msg,
-        "❌ Вы никого не указали.\n\n"
-        "Ответьте <b>реплаем</b> на сообщение нарушителя и повторите команду.\n"
-        "Свайп по его сообщению вправо → появится полоска «Ответить».",
+        "❌ Вы никого не реплайнули.\n\n"
+        "Ответь <b>реплаем</b> на сообщение нарушителя и повтори команду.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -927,7 +937,7 @@ async def link_guard_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await safe(msg.delete)
-    note = await eph(
+    await eph(
         msg,
         "🚫 Ссылки в этом чате запрещены.",
         disable_notification=True,
@@ -2118,7 +2128,7 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += f"\n<a href='{link}'>→ Сообщение</a>"
 
     kb = mod_kb(msg.chat.id, target.id, report_id=rid)
-    sent = await send_admin(
+    sent = await send_report(
         ctx.bot, text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
