@@ -1038,6 +1038,7 @@ HELP_BLOCKS = {
         "<b>Управление рангами:</b>\n"
         "• <code>/setrank алиас</code> · <code>выдатьранг алиас</code> — реплай\n"
         "• <code>/unrank</code> · <code>снятьранг</code> — реплай\n"
+        "• <code>/roles</code> · <code>роли</code> — все с рангами\n"
         "• <code>/ranks</code> · <code>ранги</code> — список алиасов\n\n",
         RANK_OWNER,
     ),
@@ -1049,7 +1050,8 @@ HELP_BLOCKS = {
     "mod_junior_admin": (
         "<b>Админ-команды (реплай):</b>\n"
         "• <code>/ban [причина]</code> · <code>бан</code>\n"
-        "• <code>/unban user_id</code> · <code>разбан</code>\n\n",
+        "• <code>/unban user_id</code> · <code>разбан</code>\n"
+        "• <code>/roles</code> · <code>роли</code> — все с рангами\n\n",
         RANK_JUNIOR_ADMIN,
     ),
     "mod_junior_mod": (
@@ -1137,6 +1139,84 @@ async def cmd_ranks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @mod_action
+async def cmd_roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None or msg.chat.type == "private":
+        return
+
+    my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
+    if my_rank < RANK_SENIOR_ADMIN:
+        await _rank_error(update, RANK_SENIOR_ADMIN, my_rank)
+        return
+
+    chat_id = msg.chat.id
+    entries: dict = {}
+
+    rows = await db_exec(
+        "SELECT user_id, username, first_name, rank FROM users WHERE chat_id=? AND rank>0",
+        (chat_id,), fetch="all",
+    ) or []
+    for row in rows:
+        uid = row["user_id"]
+        entries[uid] = [row["rank"], row["username"] or row["first_name"] or ""]
+
+    try:
+        admins = await ctx.bot.get_chat_administrators(chat_id)
+        for a in admins:
+            u = a.user
+            if u is None or u.is_bot:
+                continue
+            if a.status == "creator":
+                r = RANK_OWNER
+            elif a.status == "administrator":
+                r = RANK_SENIOR_ADMIN
+            else:
+                continue
+            if u.id in entries:
+                entries[u.id][0] = max(entries[u.id][0], r)
+            else:
+                entries[u.id] = [r, u.username or u.first_name or ""]
+    except Exception as e:
+        log.debug("get_chat_administrators fail: %s", e)
+
+    if not entries:
+        await eph(msg, "📭 Пока ни у кого нет ролей.")
+        return
+
+    by_rank: dict = defaultdict(list)
+    for uid, (r, name) in entries.items():
+        by_rank[r].append((uid, name))
+
+    lines = ["<b>👥 Роли в этом чате</b>"]
+    for r in sorted(by_rank.keys(), reverse=True):
+        lines.append(f"\n<b>{RANK_NAMES.get(r, '—')}</b>")
+        for uid, name in by_rank[r]:
+            if name:
+                lines.append(f"• {esc(name)} — <code>{uid}</code>")
+            else:
+                lines.append(f"• <code>{uid}</code>")
+
+    full = "\n".join(lines)
+
+    if len(full) <= 3800:
+        await safe(msg.reply_text, full, parse_mode=ParseMode.HTML,
+                   disable_web_page_preview=True)
+        return
+
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3800:
+            await safe(msg.reply_text, chunk, parse_mode=ParseMode.HTML,
+                       disable_web_page_preview=True)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await safe(msg.reply_text, chunk, parse_mode=ParseMode.HTML,
+                   disable_web_page_preview=True)
+
+
+@mod_action
 async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
@@ -1149,17 +1229,38 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
-        await eph(msg, "Ответь на сообщение и напиши: <code>/setrank младший_мод</code>",
-                  parse_mode=ParseMode.HTML)
+        await eph(
+            msg,
+            "❌ Нужно ответить на сообщение того, кому выдаёшь ранг.\n\n"
+            "Пример: ответь на сообщение и напиши <code>выдатьранг мл_мод</code>\n\n"
+            "Доступные ранги:\n" + RANK_HINTS,
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     parts = (msg.text or "").split()
-    if len(parts) < 2 or parts[1].lower() not in RANK_ALIASES:
-        await eph(msg, "Укажи ранг:\n" + RANK_HINTS, parse_mode=ParseMode.HTML)
+    if len(parts) < 2:
+        await eph(
+            msg,
+            "❌ Не указан ранг.\n\n"
+            "Пример: <code>выдатьранг мл_мод</code>\n\n"
+            "Доступные ранги:\n" + RANK_HINTS,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    key = parts[1].lower().strip()
+    if key not in RANK_ALIASES:
+        await eph(
+            msg,
+            f"❌ Ранг <code>{esc(key)}</code> не найден.\n\n"
+            "Доступные ранги:\n" + RANK_HINTS,
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     target = msg.reply_to_message.from_user
-    rank = RANK_ALIASES[parts[1].lower()]
+    rank = RANK_ALIASES[key]
     await set_rank(target.id, msg.chat.id, rank)
     await log_action(ctx.bot, user, f"👑 Выдача ранга: {RANK_NAMES[rank]}", target, "", msg.chat.id)
     await eph(
@@ -1182,7 +1283,7 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
-        await eph(msg, "Ответь на сообщение того, у кого нужно снять ранг.",
+        await eph(msg, "❌ Ответь на сообщение того, у кого снять ранг.",
                   parse_mode=ParseMode.HTML)
         return
 
@@ -1212,7 +1313,7 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_ADMIN, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "Ответь на сообщение нарушителя."); return
+        await eph(msg, "❌ Ответь на сообщение нарушителя."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     reason = " ".join((msg.text or "").split()[1:]) or "—"
@@ -1236,7 +1337,7 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_ADMIN, my_rank); return
     parts = (msg.text or "").split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await eph(msg, "Использование: <code>/unban user_id</code>",
+        await eph(msg, "❌ Использование: <code>/unban user_id</code>",
                   parse_mode=ParseMode.HTML); return
     uid = int(parts[1])
     try:
@@ -1259,7 +1360,7 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "Ответь на сообщение."); return
+        await eph(msg, "❌ Ответь на сообщение."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     try:
@@ -1282,7 +1383,7 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "Ответь на сообщение."); return
+        await eph(msg, "❌ Ответь на сообщение."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     parts = (msg.text or "").split()
@@ -1315,7 +1416,7 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "Ответь на сообщение."); return
+        await eph(msg, "❌ Ответь на сообщение."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     try:
@@ -1338,7 +1439,7 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "Ответь на сообщение."); return
+        await eph(msg, "❌ Ответь на сообщение."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     settings = await get_settings(msg.chat.id)
@@ -1367,7 +1468,7 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "Ответь на сообщение."); return
+        await eph(msg, "❌ Ответь на сообщение."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     await reset_warns(t.id, msg.chat.id)
@@ -1400,7 +1501,7 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "Ответь на сообщение и напиши /mod"); return
+        await eph(msg, "❌ Ответь на сообщение и напиши /mod"); return
     sent = await safe(
         msg.reply_text,
         f"🛡 <b>Модерация</b>\n"
@@ -1593,7 +1694,8 @@ async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         raw_action = parts[3].lower() if len(parts) > 3 else "варн"
         action = ACTION_ALIASES.get(raw_action)
         if not action:
-            await eph(msg, f"Не понял действие. Доступно: <b>{ACTION_HINTS}</b>",
+            await eph(msg, f"❌ Неизвестное действие <code>{esc(raw_action)}</code>.\n\n"
+                          f"Доступно: <b>{ACTION_HINTS}</b>",
                       parse_mode=ParseMode.HTML); return
         await add_trigger(msg.chat.id, word, action)
         await log_action(ctx.bot, user, f"📌 Триггер +{word} → {action}", "—", "", msg.chat.id)
@@ -1613,7 +1715,13 @@ async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         txt = "\n".join(f"• <code>{esc(r['word'])}</code> → {r['action']}" for r in rows)
         await eph(msg, f"<b>Триггеры:</b>\n{txt}", parse_mode=ParseMode.HTML)
     else:
-        await eph(msg, "Некорректно. См. /help")
+        await eph(msg,
+                  "❌ Неизвестная подкоманда.\n\n"
+                  "Доступно:\n"
+                  "• <code>триггер добавить слово действие</code>\n"
+                  "• <code>триггер удалить слово</code>\n"
+                  "• <code>триггер список</code>",
+                  parse_mode=ParseMode.HTML)
 
 
 async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1626,7 +1734,7 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await eph(msg, "Использование: <code>/create_circle Название</code>",
+        await eph(msg, "❌ Использование: <code>/create_circle Название</code>",
                   parse_mode=ParseMode.HTML)
         return
 
@@ -1653,11 +1761,11 @@ async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await eph(msg, "Использование: <code>/join Название</code>",
+        await eph(msg, "❌ Использование: <code>/join Название</code>",
                   parse_mode=ParseMode.HTML); return
     c = await get_circle_by_name(msg.chat.id, parts[1].strip())
     if not c:
-        await eph(msg, "Кружок не найден."); return
+        await eph(msg, "❌ Кружок не найден."); return
     await add_circle_member(c["id"], user.id)
     await eph(msg, f"✅ Ты в кружке <b>{esc(c['name'])}</b>.", parse_mode=ParseMode.HTML)
 
@@ -1668,11 +1776,11 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await eph(msg, "Использование: <code>/leave Название</code>",
+        await eph(msg, "❌ Использование: <code>/leave Название</code>",
                   parse_mode=ParseMode.HTML); return
     c = await get_circle_by_name(msg.chat.id, parts[1].strip())
     if not c:
-        await eph(msg, "Кружок не найден."); return
+        await eph(msg, "❌ Кружок не найден."); return
     await remove_circle_member(c["id"], user.id)
     await eph(msg, f"🚪 Ты вышел из <b>{esc(c['name'])}</b>.", parse_mode=ParseMode.HTML)
 
@@ -1683,11 +1791,11 @@ async def cmd_circle_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await eph(msg, "Использование: <code>/circle_info Название</code>",
+        await eph(msg, "❌ Использование: <code>/circle_info Название</code>",
                   parse_mode=ParseMode.HTML); return
     c = await get_circle_by_name(msg.chat.id, parts[1].strip())
     if not c:
-        await eph(msg, "Кружок не найден."); return
+        await eph(msg, "❌ Кружок не найден."); return
     members = await circle_members(c["id"])
     lines = [f"👥 <b>{esc(c['name'])}</b> — {len(members)} участн."]
     for row in members[:50]:
@@ -1710,13 +1818,13 @@ async def cmd_delete_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await eph(msg, "Использование: <code>/delete_circle Название</code>",
+        await eph(msg, "❌ Использование: <code>/delete_circle Название</code>",
                   parse_mode=ParseMode.HTML); return
     c = await get_circle_by_name(msg.chat.id, parts[1].strip())
     if not c:
-        await eph(msg, "Кружок не найден."); return
+        await eph(msg, "❌ Кружок не найден."); return
     if c["owner_id"] != user.id and my_rank < RANK_SENIOR_ADMIN:
-        await eph(msg, "Только владелец кружка или старший админ."); return
+        await eph(msg, "❌ Только владелец кружка или старший админ."); return
     await delete_circle(c["id"])
     await eph(msg, f"🗑 Кружок <b>{esc(c['name'])}</b> удалён.", parse_mode=ParseMode.HTML)
 
@@ -1771,7 +1879,7 @@ async def cmd_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = (msg.text or "").split()
     arg = parts[1].lower() if len(parts) > 1 else ""
     if arg not in ("on", "off", "вкл", "выкл", "включить", "выключить"):
-        await eph(msg, "Использование: <code>/links вкл</code> или <code>/links выкл</code>",
+        await eph(msg, "❌ Использование: <code>/links вкл</code> или <code>/links выкл</code>",
                   parse_mode=ParseMode.HTML); return
 
     thread_id = msg.message_thread_id or 0
@@ -1789,12 +1897,12 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
         await safe(msg.reply_text,
-                   "Ответь на сообщение нарушителя и напиши <code>/report причина</code>",
+                   "❌ Ответь на сообщение нарушителя и напиши <code>/report причина</code>",
                    parse_mode=ParseMode.HTML); return
 
     target = msg.reply_to_message.from_user
     if target.id == user.id or target.is_bot:
-        await safe(msg.reply_text, "Нельзя репортить себя или бота."); return
+        await safe(msg.reply_text, "❌ Нельзя репортить себя или бота."); return
 
     parts = (msg.text or "").split(maxsplit=1)
     reason = parts[1].strip() if len(parts) > 1 else "—"
@@ -1966,15 +2074,15 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if key_raw in ("flood", "флуд"):
         if len(parts) < 4:
-            await eph(msg, "Использование: <code>/settings флуд N 10с</code>",
+            await eph(msg, "❌ Использование: <code>/settings флуд N 10с</code>",
                       parse_mode=ParseMode.HTML); return
         try:
             n = int(parts[2])
         except ValueError:
-            await eph(msg, "Первое значение — число сообщений."); return
+            await eph(msg, "❌ Первое значение — число сообщений."); return
         w = parse_setting_time(parts[3])
         if n <= 0 or w <= 0:
-            await eph(msg, "Оба значения должны быть > 0."); return
+            await eph(msg, "❌ Оба значения должны быть > 0."); return
         await set_setting(msg.chat.id, "flood_limit", n)
         await set_setting(msg.chat.id, "flood_window", w)
         await log_action(ctx.bot, user, f"⚙️ flood → {n} за {fmt_seconds(w)}", "—", "", msg.chat.id)
@@ -1984,14 +2092,17 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if key_raw not in SETTING_ALIASES:
-        await eph(msg, _settings_help(), parse_mode=ParseMode.HTML, delay=60.0)
+        await eph(msg,
+                  f"❌ Параметр <code>{esc(key_raw)}</code> не найден.\n\n"
+                  + _settings_help(),
+                  parse_mode=ParseMode.HTML, delay=60.0)
         return
 
     key = SETTING_ALIASES[key_raw]
 
     if key in BOOL_SETTINGS:
         if len(parts) < 3:
-            await eph(msg, f"Использование: <code>/settings {key_raw} вкл|выкл</code>",
+            await eph(msg, f"❌ Использование: <code>/settings {key_raw} вкл|выкл</code>",
                       parse_mode=ParseMode.HTML); return
         raw = parts[2].lower()
         if raw in ("on", "1", "вкл", "включить", "да", "yes", "true"):
@@ -1999,7 +2110,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif raw in ("off", "0", "выкл", "выключить", "нет", "no", "false"):
             val = 0
         else:
-            await eph(msg, "Значение: вкл/выкл (или on/off)"); return
+            await eph(msg, "❌ Значение должно быть <b>вкл</b> или <b>выкл</b>."); return
         await set_setting(msg.chat.id, key, val)
         await log_action(ctx.bot, user, f"⚙️ {key} → {'вкл' if val else 'выкл'}", "—", "", msg.chat.id)
         await eph(msg, f"✅ {key_raw} → <b>{'вкл' if val else 'выкл'}</b>",
@@ -2008,18 +2119,18 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if len(parts) < 3:
         if key in TIME_SETTINGS:
-            await eph(msg, f"Использование: <code>/settings {key_raw} 30м</code>\n"
+            await eph(msg, f"❌ Использование: <code>/settings {key_raw} 30м</code>\n"
                           f"Формат: 10с / 30м / 1ч / 2д",
                       parse_mode=ParseMode.HTML)
         else:
-            await eph(msg, f"Использование: <code>/settings {key_raw} N</code>",
+            await eph(msg, f"❌ Использование: <code>/settings {key_raw} N</code>",
                       parse_mode=ParseMode.HTML)
         return
 
     if key in TIME_SETTINGS:
         secs = parse_setting_time(parts[2])
         if secs <= 0:
-            await eph(msg, "Не понял время. Пример: <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code>",
+            await eph(msg, "❌ Не распознал время. Пример: <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code>",
                       parse_mode=ParseMode.HTML)
             return
         await set_setting(msg.chat.id, key, secs)
@@ -2031,9 +2142,9 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         val = int(parts[2])
     except ValueError:
-        await eph(msg, "Число нужно."); return
+        await eph(msg, "❌ Нужно число."); return
     if val < 0:
-        await eph(msg, "Число не может быть отрицательным."); return
+        await eph(msg, "❌ Число не может быть отрицательным."); return
 
     await set_setting(msg.chat.id, key, val)
     await log_action(ctx.bot, user, f"⚙️ {key} → {val}", "—", "", msg.chat.id)
@@ -2080,6 +2191,9 @@ RU_ALIASES = [
     (r"^я$",                       cmd_me),
     (r"^помощь(?:\s|$)",           cmd_help),
     (r"^ранги(?:\s|$)",            cmd_ranks),
+    (r"^роли(?:\s|$)",             cmd_roles),
+    (r"^списокролей(?:\s|$)",      cmd_roles),
+    (r"^всеранги(?:\s|$)",         cmd_roles),
     (r"^чистка(?:\s|$)",           cmd_clean),
     (r"^ссылки(?:\s|$)",           cmd_links),
     (r"^выдатьранг(?:\s|$)",       cmd_setrank),
@@ -2129,6 +2243,7 @@ async def _build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ranks", cmd_ranks))
+    app.add_handler(CommandHandler("roles", cmd_roles))
     app.add_handler(CommandHandler("setrank", cmd_setrank, filters=G))
     app.add_handler(CommandHandler("unrank", cmd_unrank, filters=G))
 
