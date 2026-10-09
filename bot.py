@@ -132,13 +132,39 @@ RANK_NAMES = {
 }
 
 RANK_ALIASES = {
-    "owner":        RANK_OWNER,
-    "senior_admin": RANK_SENIOR_ADMIN,
-    "junior_admin": RANK_JUNIOR_ADMIN,
-    "senior_mod":   RANK_SENIOR_MOD,
-    "junior_mod":   RANK_JUNIOR_MOD,
-    "user":         RANK_USER,
+    "owner":           RANK_OWNER,
+    "владелец":        RANK_OWNER,
+    "создатель":       RANK_OWNER,
+
+    "senior_admin":    RANK_SENIOR_ADMIN,
+    "старший_админ":   RANK_SENIOR_ADMIN,
+    "ст_админ":        RANK_SENIOR_ADMIN,
+
+    "junior_admin":    RANK_JUNIOR_ADMIN,
+    "младший_админ":   RANK_JUNIOR_ADMIN,
+    "мл_админ":        RANK_JUNIOR_ADMIN,
+
+    "senior_mod":      RANK_SENIOR_MOD,
+    "старший_мод":     RANK_SENIOR_MOD,
+    "ст_мод":          RANK_SENIOR_MOD,
+
+    "junior_mod":      RANK_JUNIOR_MOD,
+    "младший_мод":     RANK_JUNIOR_MOD,
+    "мл_мод":          RANK_JUNIOR_MOD,
+
+    "user":            RANK_USER,
+    "участник":        RANK_USER,
+    "юзер":            RANK_USER,
 }
+
+RANK_HINTS = (
+    "owner / владелец / создатель\n"
+    "senior_admin / старший_админ / ст_админ\n"
+    "junior_admin / младший_админ / мл_админ\n"
+    "senior_mod / старший_мод / ст_мод\n"
+    "junior_mod / младший_мод / мл_мод\n"
+    "user / участник / юзер"
+)
 
 MUTE_PERMS = ChatPermissions(can_send_messages=False)
 UNMUTE_PERMS = ChatPermissions(
@@ -180,10 +206,17 @@ async def _del_later(bot, chat_id: int, message_id: int, delay: float):
     await safe(bot.delete_message, chat_id, message_id)
 
 
-async def eph(msg, text: str, delay: float = EPHEMERAL_DELAY, **kwargs):
+async def eph(msg, text: str, delay: float = EPHEMERAL_DELAY, bot=None, **kwargs):
     sent = await safe(msg.reply_text, text, **kwargs)
     if sent is not None and delay > 0:
-        asyncio.create_task(_del_later(msg.bot, msg.chat.id, sent.message_id, delay))
+        actual_bot = bot
+        if actual_bot is None:
+            try:
+                actual_bot = await msg.get_bot()
+            except Exception:
+                actual_bot = None
+        if actual_bot is not None:
+            asyncio.create_task(_del_later(actual_bot, msg.chat.id, sent.message_id, delay))
     return sent
 
 
@@ -195,7 +228,37 @@ async def send_admin(bot, text: str, **kwargs):
     if sent is None and REPORT_THREAD_ID:
         kw.pop("message_thread_id", None)
         sent = await safe(bot.send_message, ADMIN_CHAT_ID, text, **kw)
+    if sent is None:
+        log.warning("send_admin: не удалось доставить лог в %s", ADMIN_CHAT_ID)
     return sent
+
+
+async def log_action(bot, actor, action: str, target, reason: str = "", chat_id: int = 0):
+    if actor is None:
+        actor_m = "—"
+        actor_id = 0
+    else:
+        actor_m = actor.mention_html()
+        actor_id = actor.id
+
+    if hasattr(target, "mention_html"):
+        target_m = target.mention_html()
+        target_id = target.id
+    else:
+        target_m = f"<code>{target}</code>"
+        target_id = target
+
+    text = (
+        f"📋 <b>Действие модератора</b>\n"
+        f"👮 Кто: {actor_m} (<code>{actor_id}</code>)\n"
+        f"🎯 Кого: {target_m} (<code>{target_id}</code>)\n"
+        f"⚙️ Что: <b>{action}</b>\n"
+        f"💬 Чат: <code>{chat_id}</code>"
+    )
+    if reason:
+        text += f"\n📝 Причина: {esc(reason)}"
+    await send_admin(bot, text, parse_mode=ParseMode.HTML,
+                     disable_web_page_preview=True)
 
 
 def parse_duration(s: str) -> int:
@@ -647,6 +710,19 @@ _raid_buckets:  dict = defaultdict(deque)
 _raid_alerted:  dict = {}
 
 
+async def private_block_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None:
+        return
+    if msg.chat.type != "private":
+        return
+    await safe(
+        msg.reply_text,
+        "⛔ У вас недостаточно прав, для обновления прав обратитесь к техническому специалисту",
+    )
+    raise ApplicationHandlerStop
+
+
 async def pre_remember(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg is None or msg.chat.type == "private":
@@ -700,6 +776,7 @@ async def antispam_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         if note is not None:
             asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, EPHEMERAL_DELAY))
+        await log_action(ctx.bot, None, f"🔇 Авто-мут за флуд {minutes} мин", user, "", msg.chat.id)
         bucket.clear()
         raise ApplicationHandlerStop
 
@@ -775,6 +852,7 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str):
         )
         if note is not None:
             asyncio.create_task(_del_later(bot, chat_id, note.message_id, EPHEMERAL_DELAY))
+        await log_action(bot, None, f"⚠️ Авто-варн (триггер: {word}) {total}/3", user, "", chat_id)
         if total >= 3:
             await _mute_member(bot, chat_id, uid, 60)
             await reset_warns(uid, chat_id)
@@ -783,17 +861,21 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str):
                                parse_mode=ParseMode.HTML)
             if note2 is not None:
                 asyncio.create_task(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
+            await log_action(bot, None, "🔇 Авто-мут 1ч (3/3 варна)", user, "", chat_id)
     elif action == "mute":
         await _mute_member(bot, chat_id, uid, 60)
+        await log_action(bot, None, f"🔇 Авто-мут (триггер: {word})", user, "", chat_id)
     elif action == "kick":
         try:
             await bot.ban_chat_member(chat_id, uid)
             await bot.unban_chat_member(chat_id, uid)
+            await log_action(bot, None, f"👢 Авто-кик (триггер: {word})", user, "", chat_id)
         except Exception as e:
             log.debug("kick fail: %s", e)
     elif action == "ban":
         try:
             await bot.ban_chat_member(chat_id, uid)
+            await log_action(bot, None, f"🔨 Авто-бан (триггер: {word})", user, "", chat_id)
         except Exception as e:
             log.debug("ban fail: %s", e)
 
@@ -959,14 +1041,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if msg is None or user is None:
         return
-    if msg.chat.type == "private":
-        await safe(
-            msg.reply_text,
-            "👋 Привет. Добавь меня в группу — там работают все команды.\n"
-            "После добавления напиши <code>/help</code>.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
     text = await build_help(ctx.bot, msg.chat.id, user.id)
     await safe(msg.reply_text, text, parse_mode=ParseMode.HTML,
                disable_web_page_preview=True)
@@ -977,14 +1051,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if msg is None or user is None:
         return
-    if msg.chat.type == "private":
-        await safe(
-            msg.reply_text,
-            "Команды работают только в групповых чатах.\n"
-            "Добавь меня в группу и напиши <code>/help</code> там.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
     text = await build_help(ctx.bot, msg.chat.id, user.id)
     await safe(msg.reply_text, text, parse_mode=ParseMode.HTML,
                disable_web_page_preview=True)
@@ -994,10 +1060,11 @@ async def cmd_ranks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg is None:
         return
-    lines = ["<b>Доступные ранги:</b>"]
-    for alias, val in RANK_ALIASES.items():
-        lines.append(f"• <code>{alias}</code> → {RANK_NAMES[val]}")
-    await safe(msg.reply_text, "\n".join(lines), parse_mode=ParseMode.HTML)
+    await safe(
+        msg.reply_text,
+        "<b>Доступные ранги:</b>\n" + RANK_HINTS,
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @mod_action
@@ -1013,19 +1080,19 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
-        await eph(msg, "Ответь на сообщение и напиши: <code>/setrank junior_mod</code>",
+        await eph(msg, "Ответь на сообщение и напиши: <code>/setrank младший_мод</code>",
                   parse_mode=ParseMode.HTML)
         return
 
     parts = (msg.text or "").split()
-    if len(parts) < 2 or parts[1] not in RANK_ALIASES:
-        await eph(msg, "Укажи ранг: " + ", ".join(RANK_ALIASES.keys()),
-                  parse_mode=ParseMode.HTML)
+    if len(parts) < 2 or parts[1].lower() not in RANK_ALIASES:
+        await eph(msg, "Укажи ранг:\n" + RANK_HINTS, parse_mode=ParseMode.HTML)
         return
 
     target = msg.reply_to_message.from_user
-    rank = RANK_ALIASES[parts[1]]
+    rank = RANK_ALIASES[parts[1].lower()]
     await set_rank(target.id, msg.chat.id, rank)
+    await log_action(ctx.bot, user, f"👑 Выдача ранга: {RANK_NAMES[rank]}", target, "", msg.chat.id)
     await eph(
         msg,
         f"✅ Выдано: {target.mention_html()} → <b>{RANK_NAMES[rank]}</b>",
@@ -1052,6 +1119,7 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     target = msg.reply_to_message.from_user
     await set_rank(target.id, msg.chat.id, RANK_USER)
+    await log_action(ctx.bot, user, "👑 Снятие ранга", target, "", msg.chat.id)
     await eph(
         msg,
         f"✅ Снято: {target.mention_html()} → <b>{RANK_NAMES[RANK_USER]}</b>",
@@ -1082,6 +1150,7 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await ctx.bot.ban_chat_member(msg.chat.id, t.id)
         await add_blacklist(t.id, msg.chat.id, "banned")
+        await log_action(ctx.bot, user, "🔨 Бан", t, reason, msg.chat.id)
         await eph(msg, f"🔨 Готово: {t.mention_html()} забанен.\nПричина: {esc(reason)}",
                   parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -1104,6 +1173,7 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await ctx.bot.unban_chat_member(msg.chat.id, uid)
         await remove_blacklist(uid, msg.chat.id)
+        await log_action(ctx.bot, user, "🔓 Разбан", uid, "", msg.chat.id)
         await eph(msg, f"✅ Готово: <code>{uid}</code> разбанен.",
                   parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -1126,6 +1196,7 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await ctx.bot.ban_chat_member(msg.chat.id, t.id)
         await ctx.bot.unban_chat_member(msg.chat.id, t.id)
+        await log_action(ctx.bot, user, "👢 Кик", t, "", msg.chat.id)
         await eph(msg, f"👢 Готово: {t.mention_html()} кикнут.",
                   parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -1155,6 +1226,7 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             until_date=int(time.time()) + secs,
         )
         await set_mute(t.id, msg.chat.id, None)
+        await log_action(ctx.bot, user, f"🔇 Мут на {fmt_seconds(secs)}", t, "", msg.chat.id)
         await eph(msg,
                   f"🔇 Готово: {t.mention_html()} замучен на {fmt_seconds(secs)}.",
                   parse_mode=ParseMode.HTML)
@@ -1178,6 +1250,7 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await ctx.bot.restrict_chat_member(msg.chat.id, t.id, UNMUTE_PERMS)
         await set_mute(t.id, msg.chat.id, None)
+        await log_action(ctx.bot, user, "🔊 Размут", t, "", msg.chat.id)
         await eph(msg, f"🔊 Готово: {t.mention_html()} размучен.",
                   parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -1198,6 +1271,7 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     total = await add_warn(t.id, msg.chat.id)
+    await log_action(ctx.bot, user, f"⚠️ Варн ({total}/3)", t, "", msg.chat.id)
     await eph(msg, f"⚠️ Готово: {t.mention_html()} — предупреждение ({total}/3).",
               parse_mode=ParseMode.HTML)
     if total >= 3:
@@ -1207,6 +1281,7 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 until_date=int(time.time()) + 3600,
             )
             await reset_warns(t.id, msg.chat.id)
+            await log_action(ctx.bot, user, "🔇 Авто-мут 1ч (3/3)", t, "", msg.chat.id)
             await eph(msg, f"🔇 {t.mention_html()} — авто-мут на 1 час (3/3).",
                       parse_mode=ParseMode.HTML)
         except Exception as e:
@@ -1227,6 +1302,7 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     await reset_warns(t.id, msg.chat.id)
+    await log_action(ctx.bot, user, "♻️ Сброс варнов", t, "", msg.chat.id)
     await eph(msg, f"♻️ Готово: предупреждения {t.mention_html()} сброшены.",
               parse_mode=ParseMode.HTML)
 
@@ -1292,13 +1368,17 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         member = await ctx.bot.get_chat_member(chat_id, target_id)
         mention = member.user.mention_html()
+        target_user_obj = member.user
     except Exception:
         mention = f"<code>{target_id}</code>"
+        target_user_obj = None
 
     result = ""
 
     if action == "warn":
         total = await add_warn(target_id, chat_id)
+        await log_action(ctx.bot, q.from_user, f"⚠️ Варн ({total}/3) [кнопка]",
+                         target_user_obj or target_id, "", chat_id)
         result = f"⚠️ {mention} — варн ({total}/3)"
         if total >= 3:
             try:
@@ -1307,6 +1387,8 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     until_date=int(time.time()) + 3600,
                 )
                 await reset_warns(target_id, chat_id)
+                await log_action(ctx.bot, q.from_user, "🔇 Авто-мут 1ч (3/3) [кнопка]",
+                                 target_user_obj or target_id, "", chat_id)
                 result += " → 🔇 авто-мут 1ч"
             except Exception as e:
                 result += f" (мут не удался: {esc(e)})"
@@ -1318,6 +1400,8 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 until_date=int(time.time()) + 1800,
             )
             await set_mute(target_id, chat_id, None)
+            await log_action(ctx.bot, q.from_user, "🔇 Мут 30м [кнопка]",
+                             target_user_obj or target_id, "", chat_id)
             result = f"🔇 {mention} — мут 30 мин"
         except Exception as e:
             result = f"❌ мут: {esc(e)}"
@@ -1326,6 +1410,8 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.ban_chat_member(chat_id, target_id)
             await ctx.bot.unban_chat_member(chat_id, target_id)
+            await log_action(ctx.bot, q.from_user, "👢 Кик [кнопка]",
+                             target_user_obj or target_id, "", chat_id)
             result = f"👢 {mention} — кикнут"
         except Exception as e:
             result = f"❌ кик: {esc(e)}"
@@ -1334,6 +1420,8 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.ban_chat_member(chat_id, target_id)
             await add_blacklist(target_id, chat_id, "banned_via_button")
+            await log_action(ctx.bot, q.from_user, "🔨 Бан [кнопка]",
+                             target_user_obj or target_id, "", chat_id)
             result = f"🔨 {mention} — забанен"
         except Exception as e:
             result = f"❌ бан: {esc(e)}"
@@ -1342,6 +1430,8 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.unban_chat_member(chat_id, target_id)
             await remove_blacklist(target_id, chat_id)
+            await log_action(ctx.bot, q.from_user, "🔓 Разбан [кнопка]",
+                             target_user_obj or target_id, "", chat_id)
             result = f"🔓 {mention} — разбанен"
         except Exception as e:
             result = f"❌ разбан: {esc(e)}"
@@ -1350,12 +1440,16 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.restrict_chat_member(chat_id, target_id, UNMUTE_PERMS)
             await set_mute(target_id, chat_id, None)
+            await log_action(ctx.bot, q.from_user, "🔊 Размут [кнопка]",
+                             target_user_obj or target_id, "", chat_id)
             result = f"🔊 {mention} — размучен"
         except Exception as e:
             result = f"❌ размут: {esc(e)}"
 
     elif action == "unwarn":
         await reset_warns(target_id, chat_id)
+        await log_action(ctx.bot, q.from_user, "♻️ Анварн [кнопка]",
+                         target_user_obj or target_id, "", chat_id)
         result = f"♻️ {mention} — варны сброшены"
 
     elif action == "profile":
@@ -1425,11 +1519,14 @@ async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if action not in ("warn", "mute", "kick", "ban"):
             await eph(msg, "Действия: warn / mute / kick / ban"); return
         await add_trigger(msg.chat.id, word, action)
+        await log_action(ctx.bot, user, f"📌 Триггер +{word} → {action}", "—", "", msg.chat.id)
         await eph(msg, f"✅ Триггер <code>{esc(word)}</code> → <b>{action}</b>",
                   parse_mode=ParseMode.HTML)
 
     elif sub == "del" and len(parts) >= 3:
-        await del_trigger(msg.chat.id, parts[2].lower())
+        w = parts[2].lower()
+        await del_trigger(msg.chat.id, w)
+        await log_action(ctx.bot, user, f"📌 Триггер −{w}", "—", "", msg.chat.id)
         await eph(msg, "🗑 Триггер удалён.")
 
     elif sub == "list":
@@ -1575,6 +1672,7 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     await forget_messages(msg.chat.id, ids)
+    await log_action(ctx.bot, user, f"🧹 Чистка: {deleted} сообщ.", "—", "", msg.chat.id)
     note_kwargs = {"message_thread_id": thread_id} if thread_id else {}
     note = await safe(
         ctx.bot.send_message, msg.chat.id,
@@ -1603,6 +1701,7 @@ async def cmd_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     thread_id = msg.message_thread_id or 0
     allowed = (arg == "on")
     await set_topic_links(msg.chat.id, thread_id, allowed)
+    await log_action(ctx.bot, user, f"🔗 Ссылки: {'on' if allowed else 'off'}", "—", "", msg.chat.id)
     await eph(msg,
               f"🔗 Ссылки в этой теме: <b>{'разрешены' if allowed else 'запрещены'}</b>",
               parse_mode=ParseMode.HTML)
@@ -1831,6 +1930,11 @@ async def _build_app() -> Application:
     )
 
     G = filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
+
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE, private_block_mw),
+        group=-100,
+    )
 
     app.add_handler(MessageHandler(G, pre_remember), group=-4)
 
