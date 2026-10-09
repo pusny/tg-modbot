@@ -192,6 +192,15 @@ def esc(value) -> str:
     return html.escape(str(value), quote=False)
 
 
+def _msg_link(chat_id: int, message_id: Optional[int]) -> str:
+    if not message_id:
+        return ""
+    s = str(chat_id)
+    if s.startswith("-100"):
+        return f"https://t.me/c/{s[4:]}/{message_id}"
+    return ""
+
+
 async def safe(coro_fn, *args, retries: int = 3, **kwargs):
     for attempt in range(1, retries + 1):
         try:
@@ -238,7 +247,8 @@ async def send_admin(bot, text: str, **kwargs):
     return sent
 
 
-async def log_action(bot, actor, action: str, target, reason: str = "", chat_id: int = 0):
+async def log_action(bot, actor, action: str, target, reason: str = "", chat_id: int = 0,
+                     reply_msg_id: Optional[int] = None):
     if actor is None:
         actor_line = "🤖 <i>Автоматика</i>"
     else:
@@ -257,6 +267,9 @@ async def log_action(bot, actor, action: str, target, reason: str = "", chat_id:
         f"⚙️ <b>Что:</b> {action}\n"
         f"💬 <b>Чат:</b> <code>{chat_id}</code>"
     )
+    link = _msg_link(chat_id, reply_msg_id)
+    if link:
+        text += f"\n<a href='{link}'>→ Сообщение</a>"
     if reason:
         text += f"\n\n📝 <b>Причина:</b> {esc(reason)}"
     await send_admin(bot, text, parse_mode=ParseMode.HTML,
@@ -841,7 +854,8 @@ async def antispam_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         if note is not None:
             asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, EPHEMERAL_DELAY))
-        await log_action(ctx.bot, None, f"🔇 Авто-мут за флуд {fmt_seconds(mute_sec)}", user, "", msg.chat.id)
+        await log_action(ctx.bot, None, f"🔇 Авто-мут за флуд {fmt_seconds(mute_sec)}", user, "",
+                         msg.chat.id, reply_msg_id=msg.message_id)
         bucket.clear()
         raise ApplicationHandlerStop
 
@@ -925,7 +939,8 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
         )
         if note is not None:
             asyncio.create_task(_del_later(bot, chat_id, note.message_id, EPHEMERAL_DELAY))
-        await log_action(bot, None, f"⚠️ Авто-варн (триггер: {word}) {total}/{warn_limit}", user, "", chat_id)
+        await log_action(bot, None, f"⚠️ Авто-варн (триггер: {word}) {total}/{warn_limit}",
+                         user, "", chat_id)
         if total >= warn_limit:
             await _mute_user(bot, chat_id, uid, auto_mute_sec)
             await reset_warns(uid, chat_id)
@@ -934,10 +949,13 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
                                parse_mode=ParseMode.HTML)
             if note2 is not None:
                 asyncio.create_task(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
-            await log_action(bot, None, f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit} варна)", user, "", chat_id)
+            await log_action(bot, None,
+                             f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit} варна)",
+                             user, "", chat_id)
     elif action == "mute":
         await _mute_user(bot, chat_id, uid, trig_mute_sec)
-        await log_action(bot, None, f"🔇 Авто-мут {fmt_seconds(trig_mute_sec)} (триггер: {word})", user, "", chat_id)
+        await log_action(bot, None, f"🔇 Авто-мут {fmt_seconds(trig_mute_sec)} (триггер: {word})",
+                         user, "", chat_id)
     elif action == "kick":
         try:
             await bot.ban_chat_member(chat_id, uid)
@@ -1262,7 +1280,8 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target = msg.reply_to_message.from_user
     rank = RANK_ALIASES[key]
     await set_rank(target.id, msg.chat.id, rank)
-    await log_action(ctx.bot, user, f"👑 Выдача ранга: {RANK_NAMES[rank]}", target, "", msg.chat.id)
+    await log_action(ctx.bot, user, f"👑 Выдача ранга: {RANK_NAMES[rank]}", target, "",
+                     msg.chat.id, reply_msg_id=msg.reply_to_message.message_id)
     await eph(
         msg,
         f"✅ Выдано: {target.mention_html()} → <b>{RANK_NAMES[rank]}</b>",
@@ -1289,7 +1308,8 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     target = msg.reply_to_message.from_user
     await set_rank(target.id, msg.chat.id, RANK_USER)
-    await log_action(ctx.bot, user, "👑 Снятие ранга", target, "", msg.chat.id)
+    await log_action(ctx.bot, user, "👑 Снятие ранга", target, "", msg.chat.id,
+                     reply_msg_id=msg.reply_to_message.message_id)
     await eph(
         msg,
         f"✅ Снято: {target.mention_html()} → <b>{RANK_NAMES[RANK_USER]}</b>",
@@ -1317,10 +1337,12 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
     reason = " ".join((msg.text or "").split()[1:]) or "—"
+    reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
         await ctx.bot.ban_chat_member(msg.chat.id, t.id)
         await add_blacklist(t.id, msg.chat.id, "banned")
-        await log_action(ctx.bot, user, "🔨 Бан", t, reason, msg.chat.id)
+        await log_action(ctx.bot, user, "🔨 Бан", t, reason, msg.chat.id,
+                         reply_msg_id=reply_id)
         await eph(msg, f"🔨 Готово: {t.mention_html()} забанен.\nПричина: {esc(reason)}",
                   parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -1363,10 +1385,11 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, "❌ Ответь на сообщение."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
+    reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
         await ctx.bot.ban_chat_member(msg.chat.id, t.id)
         await ctx.bot.unban_chat_member(msg.chat.id, t.id)
-        await log_action(ctx.bot, user, "👢 Кик", t, "", msg.chat.id)
+        await log_action(ctx.bot, user, "👢 Кик", t, "", msg.chat.id, reply_msg_id=reply_id)
         await eph(msg, f"👢 Готово: {t.mention_html()} кикнут.",
                   parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -1397,9 +1420,11 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if secs <= 0:
         settings = await get_settings(msg.chat.id)
         secs = int(_s(settings, "default_mute_sec", 600))
+    reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     ok = await _mute_user(ctx.bot, msg.chat.id, t.id, secs)
     if ok:
-        await log_action(ctx.bot, user, f"🔇 Мут на {fmt_seconds(secs)}", t, "", msg.chat.id)
+        await log_action(ctx.bot, user, f"🔇 Мут на {fmt_seconds(secs)}", t, "", msg.chat.id,
+                         reply_msg_id=reply_id)
         await eph(msg, f"🔇 Готово: {t.mention_html()} замучен на {fmt_seconds(secs)}.",
                   parse_mode=ParseMode.HTML)
     else:
@@ -1419,10 +1444,11 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, "❌ Ответь на сообщение."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
+    reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
         await ctx.bot.restrict_chat_member(msg.chat.id, t.id, UNMUTE_PERMS)
         await set_mute(t.id, msg.chat.id, None)
-        await log_action(ctx.bot, user, "🔊 Размут", t, "", msg.chat.id)
+        await log_action(ctx.bot, user, "🔊 Размут", t, "", msg.chat.id, reply_msg_id=reply_id)
         await eph(msg, f"🔊 Готово: {t.mention_html()} размучен.",
                   parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -1445,15 +1471,19 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     settings = await get_settings(msg.chat.id)
     warn_limit = int(_s(settings, "warn_limit", 3))
     auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
+    reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     total = await add_warn(t.id, msg.chat.id)
-    await log_action(ctx.bot, user, f"⚠️ Варн ({total}/{warn_limit})", t, "", msg.chat.id)
+    await log_action(ctx.bot, user, f"⚠️ Варн ({total}/{warn_limit})", t, "", msg.chat.id,
+                     reply_msg_id=reply_id)
     await eph(msg, f"⚠️ Готово: {t.mention_html()} — предупреждение ({total}/{warn_limit}).",
               parse_mode=ParseMode.HTML)
     if total >= warn_limit:
         ok = await _mute_user(ctx.bot, msg.chat.id, t.id, auto_mute_sec)
         if ok:
             await reset_warns(t.id, msg.chat.id)
-            await log_action(ctx.bot, user, f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit})", t, "", msg.chat.id)
+            await log_action(ctx.bot, user,
+                             f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit})",
+                             t, "", msg.chat.id, reply_msg_id=reply_id)
             await eph(msg, f"🔇 {t.mention_html()} — авто-мут на {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}).",
                       parse_mode=ParseMode.HTML)
 
@@ -1471,8 +1501,9 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, "❌ Ответь на сообщение."); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         await _deny_higher(msg, t.mention_html()); return
+    reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     await reset_warns(t.id, msg.chat.id)
-    await log_action(ctx.bot, user, "♻️ Сброс варнов", t, "", msg.chat.id)
+    await log_action(ctx.bot, user, "♻️ Сброс варнов", t, "", msg.chat.id, reply_msg_id=reply_id)
     await eph(msg, f"♻️ Готово: предупреждения {t.mention_html()} сброшены.",
               parse_mode=ParseMode.HTML)
 
