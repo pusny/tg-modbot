@@ -67,7 +67,7 @@ ANTIRAID_JOINS    = _req_int("ANTIRAID_JOINS", 10)
 ANTIRAID_WINDOW   = _req_float("ANTIRAID_WINDOW", 30.0)
 ANTIRAID_LOOKBACK = _req_float("ANTIRAID_LOOKBACK", 1800.0)
 
-EPHEMERAL_DELAY = 8.0
+EPHEMERAL_DELAY = 60.0
 MIN_TG_MUTE_SEC = 60
 
 CONNECT_TIMEOUT   = 30.0
@@ -762,7 +762,9 @@ def mod_action(fn):
             await fn(update, ctx)
         finally:
             if msg is not None and msg.chat.type != "private":
-                await safe(ctx.bot.delete_message, msg.chat.id, msg.message_id)
+                asyncio.create_task(
+                    _del_later(ctx.bot, msg.chat.id, msg.message_id, EPHEMERAL_DELAY)
+                )
     return wrapper
 
 
@@ -847,13 +849,11 @@ async def antispam_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(bucket) >= settings["flood_limit"]:
         mute_sec = int(_s(settings, "flood_mute_sec", 1800))
         await _mute_user(ctx.bot, msg.chat.id, user.id, mute_sec)
-        note = await safe(
-            ctx.bot.send_message, msg.chat.id,
+        await eph(
+            msg,
             f"🔇 {user.mention_html()} — мут за флуд на {fmt_seconds(mute_sec)}.",
             parse_mode=ParseMode.HTML,
         )
-        if note is not None:
-            asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, EPHEMERAL_DELAY))
         await log_action(ctx.bot, None, f"🔇 Авто-мут за флуд {fmt_seconds(mute_sec)}", user, "",
                          msg.chat.id, reply_msg_id=msg.message_id)
         bucket.clear()
@@ -880,13 +880,11 @@ async def link_guard_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await safe(msg.delete)
-    note = await safe(
-        ctx.bot.send_message, msg.chat.id,
+    await eph(
+        msg,
         "🚫 Ссылки в этой теме запрещены.",
         disable_notification=True,
     )
-    if note is not None:
-        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, 4.0))
     raise ApplicationHandlerStop
 
 
@@ -1125,18 +1123,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None:
         return
     text = await build_help(ctx.bot, msg.chat.id, user.id)
-    await safe(msg.reply_text, text, parse_mode=ParseMode.HTML,
-               disable_web_page_preview=True)
+    await eph(msg, text, parse_mode=ParseMode.HTML,
+              disable_web_page_preview=True)
 
 
+@mod_action
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
     if msg is None or user is None:
         return
     text = await build_help(ctx.bot, msg.chat.id, user.id)
-    await safe(msg.reply_text, text, parse_mode=ParseMode.HTML,
-               disable_web_page_preview=True)
+    await eph(msg, text, parse_mode=ParseMode.HTML,
+              disable_web_page_preview=True)
 
 
 @mod_action
@@ -1218,20 +1217,20 @@ async def cmd_roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     full = "\n".join(lines)
 
     if len(full) <= 3800:
-        await safe(msg.reply_text, full, parse_mode=ParseMode.HTML,
-                   disable_web_page_preview=True)
+        await eph(msg, full, parse_mode=ParseMode.HTML,
+                  disable_web_page_preview=True)
         return
 
     chunk = ""
     for line in lines:
         if len(chunk) + len(line) + 1 > 3800:
-            await safe(msg.reply_text, chunk, parse_mode=ParseMode.HTML,
-                       disable_web_page_preview=True)
+            await eph(msg, chunk, parse_mode=ParseMode.HTML,
+                      disable_web_page_preview=True)
             chunk = ""
         chunk += line + "\n"
     if chunk.strip():
-        await safe(msg.reply_text, chunk, parse_mode=ParseMode.HTML,
-                   disable_web_page_preview=True)
+        await eph(msg, chunk, parse_mode=ParseMode.HTML,
+                  disable_web_page_preview=True)
 
 
 @mod_action
@@ -1541,7 +1540,7 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=mod_kb(msg.chat.id, t.id),
     )
     if sent is not None:
-        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, sent.message_id, 60.0))
+        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, sent.message_id, EPHEMERAL_DELAY))
 
 
 async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1675,7 +1674,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             **send_kwargs,
         )
         if note is not None:
-            asyncio.create_task(_del_later(ctx.bot, target_chat, note.message_id, 30.0))
+            asyncio.create_task(_del_later(ctx.bot, target_chat, note.message_id, EPHEMERAL_DELAY))
         await safe(q.answer, "Профиль отправлен")
         return
 
@@ -1755,6 +1754,7 @@ async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                   parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1786,6 +1786,7 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1801,6 +1802,7 @@ async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await eph(msg, f"✅ Ты в кружке <b>{esc(c['name'])}</b>.", parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1816,6 +1818,7 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await eph(msg, f"🚪 Ты вышел из <b>{esc(c['name'])}</b>.", parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_circle_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg is None or msg.chat.type == "private":
@@ -1836,7 +1839,7 @@ async def cmd_circle_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {m.user.mention_html()}")
         except Exception:
             lines.append(f"• <code>{uid}</code>")
-    await safe(msg.reply_text, "\n".join(lines), parse_mode=ParseMode.HTML)
+    await eph(msg, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @mod_action
@@ -1895,7 +1898,7 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         **note_kwargs,
     )
     if note is not None:
-        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, 5.0))
+        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, EPHEMERAL_DELAY))
 
 
 @mod_action
@@ -1922,18 +1925,18 @@ async def cmd_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
         return
     if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
-        await safe(msg.reply_text,
-                   "❌ Ответь на сообщение нарушителя и напиши <code>/report причина</code>",
-                   parse_mode=ParseMode.HTML); return
+        await eph(msg, "❌ Ответь на сообщение нарушителя и напиши <code>/report причина</code>",
+                  parse_mode=ParseMode.HTML); return
 
     target = msg.reply_to_message.from_user
     if target.id == user.id or target.is_bot:
-        await safe(msg.reply_text, "❌ Нельзя репортить себя или бота."); return
+        await eph(msg, "❌ Нельзя репортить себя или бота."); return
 
     parts = (msg.text or "").split(maxsplit=1)
     reason = parts[1].strip() if len(parts) > 1 else "—"
@@ -1968,12 +1971,9 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb,
     )
     if sent is None:
-        await safe(msg.reply_text, "⚠️ Не смог отправить, попробуй позже."); return
-    note = await safe(msg.reply_text, "✅ Жалоба отправлена модераторам.",
-                      disable_notification=True)
-    if note is not None:
-        asyncio.create_task(_del_later(ctx.bot, note.chat.id, note.message_id, EPHEMERAL_DELAY))
-    await safe(ctx.bot.delete_message, msg.chat.id, msg.message_id)
+        await eph(msg, "⚠️ Не смог отправить, попробуй позже."); return
+    await eph(msg, "✅ Жалоба отправлена модераторам.",
+              disable_notification=True)
 
 
 async def _build_profile(ctx, chat_id: int, target) -> str:
@@ -1997,6 +1997,7 @@ async def _build_profile(ctx, chat_id: int, target) -> str:
     return "\n".join(lines)
 
 
+@mod_action
 async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None:
@@ -2014,18 +2015,19 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 target = None
         if target is None:
             target = user
-    await safe(msg.reply_text,
-               await _build_profile(ctx, msg.chat.id, target),
-               parse_mode=ParseMode.HTML)
+    await eph(msg,
+              await _build_profile(ctx, msg.chat.id, target),
+              parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None:
         return
-    await safe(msg.reply_text,
-               await _build_profile(ctx, msg.chat.id, user),
-               parse_mode=ParseMode.HTML)
+    await eph(msg,
+              await _build_profile(ctx, msg.chat.id, user),
+              parse_mode=ParseMode.HTML)
 
 
 SETTING_ALIASES = {
