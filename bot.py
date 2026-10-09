@@ -740,11 +740,27 @@ async def _rank_error(update: Update, min_rank: int, rank: int):
     )
 
 
-async def _deny_higher(msg, target_mention: str):
+async def _deny_higher(msg, target_mention: str, target_rank: int = -1):
+    if target_rank == RANK_OWNER:
+        extra = "👑 <b>Создателя</b> наказать нельзя."
+    elif target_rank == RANK_SENIOR_ADMIN:
+        extra = "🛡 <b>Старшего администратора</b> наказать нельзя."
+    else:
+        rn = RANK_NAMES.get(target_rank, "—") if target_rank >= 0 else "—"
+        extra = f"его ранг: <b>{rn}</b> — не ниже твоего."
     await eph(
         msg,
-        f"⛔ Нельзя применить действие к <b>{target_mention}</b> — "
-        f"его ранг не ниже твоего.",
+        f"⛔ Нельзя наказать: {target_mention}\n{extra}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _no_target(msg):
+    await eph(
+        msg,
+        "❌ Вы никого не указали.\n\n"
+        "Ответьте <b>реплаем</b> на сообщение нарушителя и повторите команду.\n"
+        "Свайп по его сообщению вправо → появится полоска «Ответить».",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1367,9 +1383,12 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _target_user(msg):
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        return msg.reply_to_message.from_user
-    return None
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        return None
+    t = msg.reply_to_message.from_user
+    if msg.from_user and t.id == msg.from_user.id:
+        return None
+    return t
 
 
 @mod_action
@@ -1382,9 +1401,10 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_ADMIN, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "❌ Ответь на сообщение нарушителя."); return
+        await _no_target(msg); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        await _deny_higher(msg, t.mention_html()); return
+        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
+        await _deny_higher(msg, t.mention_html(), tr); return
     reason = " ".join((msg.text or "").split()[1:]) or "—"
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
@@ -1431,9 +1451,10 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "❌ Ответь на сообщение."); return
+        await _no_target(msg); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        await _deny_higher(msg, t.mention_html()); return
+        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
+        await _deny_higher(msg, t.mention_html(), tr); return
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
         await ctx.bot.ban_chat_member(msg.chat.id, t.id)
@@ -1455,9 +1476,10 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "❌ Ответь на сообщение."); return
+        await _no_target(msg); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        await _deny_higher(msg, t.mention_html()); return
+        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
+        await _deny_higher(msg, t.mention_html(), tr); return
     parts = (msg.text or "").split()
     if len(parts) > 1:
         secs = parse_duration(parts[1])
@@ -1490,9 +1512,10 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "❌ Ответь на сообщение."); return
+        await _no_target(msg); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        await _deny_higher(msg, t.mention_html()); return
+        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
+        await _deny_higher(msg, t.mention_html(), tr); return
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
         await ctx.bot.restrict_chat_member(msg.chat.id, t.id, UNMUTE_PERMS)
@@ -1514,9 +1537,10 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "❌ Ответь на сообщение."); return
+        await _no_target(msg); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        await _deny_higher(msg, t.mention_html()); return
+        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
+        await _deny_higher(msg, t.mention_html(), tr); return
     settings = await get_settings(msg.chat.id)
     warn_limit = int(_s(settings, "warn_limit", 3))
     auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
@@ -1570,9 +1594,10 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "❌ Ответь на сообщение."); return
+        await _no_target(msg); return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        await _deny_higher(msg, t.mention_html()); return
+        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
+        await _deny_higher(msg, t.mention_html(), tr); return
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     await reset_warns(t.id, msg.chat.id)
     await log_action(ctx.bot, user, "♻️ Сброс варнов", t, "", msg.chat.id, reply_msg_id=reply_id)
@@ -1604,7 +1629,7 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await eph(msg, "❌ Ответь на сообщение и напиши /mod"); return
+        await _no_target(msg); return
     sent = await safe(
         msg.reply_text,
         f"🛡 <b>Модерация</b>\n"
@@ -1637,7 +1662,12 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action in ("ban", "kick", "mute", "warn", "unmute", "unwarn"):
         if not await can_act_on(ctx.bot, chat_id, q.from_user.id, target_id):
-            await safe(q.answer, "⛔ Его ранг не ниже твоего.", show_alert=True)
+            try:
+                tr = await resolve_rank(ctx.bot, chat_id, target_id)
+                rn = RANK_NAMES.get(tr, "—")
+            except Exception:
+                rn = "—"
+            await safe(q.answer, f"⛔ Нельзя — его ранг: {rn}", show_alert=True)
             return
 
     settings = await get_settings(chat_id)
