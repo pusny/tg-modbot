@@ -67,6 +67,8 @@ ANTIRAID_JOINS    = _req_int("ANTIRAID_JOINS", 10)
 ANTIRAID_WINDOW   = _req_float("ANTIRAID_WINDOW", 30.0)
 ANTIRAID_LOOKBACK = _req_float("ANTIRAID_LOOKBACK", 1800.0)
 
+EPHEMERAL_DELAY = 8.0
+
 CONNECT_TIMEOUT   = 30.0
 READ_TIMEOUT      = 30.0
 WRITE_TIMEOUT     = 30.0
@@ -171,6 +173,18 @@ async def safe(coro_fn, *args, retries: int = 3, **kwargs):
         except Exception as e:
             log.debug("safe(): non-network error — %s", e)
             return None
+
+
+async def _del_later(bot, chat_id: int, message_id: int, delay: float):
+    await asyncio.sleep(delay)
+    await safe(bot.delete_message, chat_id, message_id)
+
+
+async def eph(msg, text: str, delay: float = EPHEMERAL_DELAY, **kwargs):
+    sent = await safe(msg.reply_text, text, **kwargs)
+    if sent is not None and delay > 0:
+        asyncio.create_task(_del_later(msg.bot, msg.chat.id, sent.message_id, delay))
+    return sent
 
 
 async def send_admin(bot, text: str, **kwargs):
@@ -564,12 +578,18 @@ async def resolve_rank(bot, chat_id: int, user_id: int) -> int:
     return db_rank
 
 
+async def can_act_on(bot, chat_id: int, actor_id: int, target_id: int) -> bool:
+    actor_rank = await resolve_rank(bot, chat_id, actor_id)
+    target_rank = await resolve_rank(bot, chat_id, target_id)
+    return actor_rank > target_rank
+
+
 async def _rank_error(update: Update, min_rank: int, rank: int):
     msg = update.effective_message
     if msg is None:
         return
-    await safe(
-        msg.reply_text,
+    await eph(
+        msg,
         f"⛔ Недостаточно прав.\n"
         f"Нужен: <b>{RANK_NAMES.get(min_rank, '—')}</b>\n"
         f"У тебя: <b>{RANK_NAMES.get(rank, '—')}</b>",
@@ -577,20 +597,41 @@ async def _rank_error(update: Update, min_rank: int, rank: int):
     )
 
 
+async def _deny_higher(msg, target_mention: str):
+    await eph(
+        msg,
+        f"⛔ Нельзя применить действие к <b>{target_mention}</b> — "
+        f"его ранг не ниже твоего.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def mod_action(fn):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        try:
+            await fn(update, ctx)
+        finally:
+            if msg is not None and msg.chat.type != "private":
+                await safe(ctx.bot.delete_message, msg.chat.id, msg.message_id)
+    return wrapper
+
+
 def mod_kb(chat_id: int, user_id: int, report_id: Optional[int] = None) -> InlineKeyboardMarkup:
     tail = f":{report_id}" if report_id else ""
     rows = [
         [
-            InlineKeyboardButton("⚠️ Warn",   callback_data=f"mod:warn:{chat_id}:{user_id}{tail}"),
-            InlineKeyboardButton("🔇 Mute",   callback_data=f"mod:mute:{chat_id}:{user_id}{tail}"),
-            InlineKeyboardButton("👢 Kick",   callback_data=f"mod:kick:{chat_id}:{user_id}{tail}"),
+            InlineKeyboardButton("⚠️ Варн",   callback_data=f"mod:warn:{chat_id}:{user_id}{tail}"),
+            InlineKeyboardButton("🔇 Мут",     callback_data=f"mod:mute:{chat_id}:{user_id}{tail}"),
+            InlineKeyboardButton("👢 Кик",     callback_data=f"mod:kick:{chat_id}:{user_id}{tail}"),
         ],
         [
-            InlineKeyboardButton("🔨 Ban",    callback_data=f"mod:ban:{chat_id}:{user_id}{tail}"),
-            InlineKeyboardButton("🔊 Unmute", callback_data=f"mod:unmute:{chat_id}:{user_id}{tail}"),
-            InlineKeyboardButton("♻️ Unwarn", callback_data=f"mod:unwarn:{chat_id}:{user_id}{tail}"),
+            InlineKeyboardButton("🔨 Бан",     callback_data=f"mod:ban:{chat_id}:{user_id}{tail}"),
+            InlineKeyboardButton("🔊 Размут",  callback_data=f"mod:unmute:{chat_id}:{user_id}{tail}"),
+            InlineKeyboardButton("♻️ Анварн",  callback_data=f"mod:unwarn:{chat_id}:{user_id}{tail}"),
         ],
         [
+            InlineKeyboardButton("🔓 Разбан",  callback_data=f"mod:unban:{chat_id}:{user_id}{tail}"),
             InlineKeyboardButton("📄 Профиль", callback_data=f"mod:profile:{chat_id}:{user_id}{tail}"),
         ],
     ]
@@ -652,11 +693,13 @@ async def antispam_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.debug("antispam restrict fail: %s", e)
 
         await set_mute(user.id, msg.chat.id, None)
-        await safe(
-            msg.reply_text,
-            f"🔇 {user.mention_html()} получил мут за флуд на {minutes} мин.",
+        note = await safe(
+            ctx.bot.send_message, msg.chat.id,
+            f"🔇 {user.mention_html()} — мут за флуд на {minutes} мин.",
             parse_mode=ParseMode.HTML,
         )
+        if note is not None:
+            asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, EPHEMERAL_DELAY))
         bucket.clear()
         raise ApplicationHandlerStop
 
@@ -681,11 +724,13 @@ async def link_guard_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await safe(msg.delete)
-    await safe(
-        msg.reply_text,
+    note = await safe(
+        ctx.bot.send_message, msg.chat.id,
         "🚫 Ссылки в этой теме запрещены.",
         disable_notification=True,
     )
+    if note is not None:
+        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, 4.0))
     raise ApplicationHandlerStop
 
 
@@ -708,9 +753,11 @@ async def trigger_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     for row in triggers:
-        word = row["word"]
-        action = row["action"]
-        if word and word in text:
+        word = (row["word"] or "").strip().lower()
+        if not word:
+            continue
+        if word in text:
+            action = row["action"]
             await safe(msg.delete)
             await _apply_trigger(ctx.bot, msg.chat.id, user, action, word)
             raise ApplicationHandlerStop
@@ -721,17 +768,21 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str):
     mention = user.mention_html()
     if action == "warn":
         total = await add_warn(uid, chat_id)
-        await safe(
+        note = await safe(
             bot.send_message, chat_id,
             f"⚠️ {mention} — предупреждение (триггер: <code>{esc(word)}</code>). Всего: {total}/3",
             parse_mode=ParseMode.HTML,
         )
+        if note is not None:
+            asyncio.create_task(_del_later(bot, chat_id, note.message_id, EPHEMERAL_DELAY))
         if total >= 3:
             await _mute_member(bot, chat_id, uid, 60)
             await reset_warns(uid, chat_id)
-            await safe(bot.send_message, chat_id,
-                       f"🔇 {mention} — авто-мут на 1 час (3/3).",
-                       parse_mode=ParseMode.HTML)
+            note2 = await safe(bot.send_message, chat_id,
+                               f"🔇 {mention} — авто-мут на 1 час (3/3).",
+                               parse_mode=ParseMode.HTML)
+            if note2 is not None:
+                asyncio.create_task(_del_later(bot, chat_id, note2.message_id, EPHEMERAL_DELAY))
     elif action == "mute":
         await _mute_member(bot, chat_id, uid, 60)
     elif action == "kick":
@@ -836,54 +887,106 @@ async def on_bot_added(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-HELP_TEXT = (
-    "🛠 <b>Модератор-бот</b>\n\n"
-    "<b>Ранги:</b>\n"
-    "• <code>owner</code> — создатель\n"
-    "• <code>senior_admin</code> / <code>junior_admin</code> — админы\n"
-    "• <code>senior_mod</code> / <code>junior_mod</code> — модераторы\n\n"
-    "<b>Управление рангами:</b>\n"
-    "• <code>/setrank &lt;alias&gt;</code> — реплай, только owner\n"
-    "• <code>/ranks</code> — список алиасов\n\n"
-    "<b>Модерация:</b>\n"
-    "• <code>/mod</code> — реплай, меню с кнопками\n"
-    "• <code>/ban [причина]</code> / <code>/unban &lt;id&gt;</code>\n"
-    "• <code>/kick</code> / <code>/mute 10m</code> / <code>/unmute</code>\n"
-    "• <code>/warn</code> / <code>/unwarn</code> / <code>/warns</code>\n\n"
-    "<b>Триггеры:</b>\n"
-    "• <code>/trigger add &lt;слово&gt; [warn|mute|kick|ban]</code>\n"
-    "• <code>/trigger del &lt;слово&gt;</code>\n"
-    "• <code>/trigger list</code>\n\n"
-    "<b>Кружки:</b>\n"
-    "• <code>/create_circle &lt;имя&gt;</code> — в топике, мод+\n"
-    "• <code>/join &lt;имя&gt;</code> / <code>/leave &lt;имя&gt;</code>\n"
-    "• <code>/circle_info &lt;имя&gt;</code>\n"
-    "• <code>/delete_circle &lt;имя&gt;</code>\n\n"
-    "<b>Темы / чат:</b>\n"
-    "• <code>/clean &lt;N&gt;</code> — снести N сообщений в текущей теме (или в чате)\n"
-    "• <code>/links on|off</code> — запрет ссылок в текущей теме (или в чате)\n\n"
-    "<b>Прочее:</b>\n"
-    "• <code>/report [причина]</code> — реплай → админ-чат\n"
-    "• <code>/profile</code> / <code>/me</code>\n"
-    "• <code>/settings</code> — настройки антиспама"
-)
+HELP_HEADER = "🛠 <b>Модератор-бот</b>\n\n"
+
+HELP_BLOCKS = {
+    "ranks_owner": (
+        "<b>Управление рангами:</b>\n"
+        "• <code>/setrank алиас</code> · <code>выдатьранг алиас</code> — реплай\n"
+        "• <code>/unrank</code> · <code>снятьранг</code> — реплай\n"
+        "• <code>/ranks</code> · <code>ранги</code> — список алиасов\n\n",
+        RANK_OWNER,
+    ),
+    "settings": (
+        "<b>Настройки:</b>\n"
+        "• <code>/settings</code> · <code>настройки</code>\n\n",
+        RANK_SENIOR_ADMIN,
+    ),
+    "mod_junior_admin": (
+        "<b>Админ-команды (реплай):</b>\n"
+        "• <code>/ban [причина]</code> · <code>бан</code>\n"
+        "• <code>/unban user_id</code> · <code>разбан</code>\n\n",
+        RANK_JUNIOR_ADMIN,
+    ),
+    "mod_junior_mod": (
+        "<b>Модерация (реплай):</b>\n"
+        "• <code>/mod</code> · <code>мод</code> — меню кнопок\n"
+        "• <code>/kick</code> · <code>кик</code>\n"
+        "• <code>/mute 10m</code> · <code>мут 10m</code>\n"
+        "• <code>/unmute</code> · <code>размут</code>\n"
+        "• <code>/warn</code> · <code>варн</code>\n"
+        "• <code>/unwarn</code> · <code>анварн</code>\n"
+        "• <code>/warns</code> · <code>варны</code>\n"
+        "• <code>/clean N</code> · <code>чистка N</code>\n\n",
+        RANK_JUNIOR_MOD,
+    ),
+    "mod_senior_mod": (
+        "<b>Старший модератор:</b>\n"
+        "• <code>/trigger add слово [warn|mute|kick|ban]</code> · <code>триггер</code>\n"
+        "• <code>/trigger del слово</code>\n"
+        "• <code>/trigger list</code>\n"
+        "• <code>/links on|off</code> · <code>ссылки on|off</code>\n"
+        "• <code>/create_circle имя</code> · <code>создатькружок</code>\n"
+        "• <code>/delete_circle имя</code> · <code>удалитькружок</code>\n\n",
+        RANK_SENIOR_MOD,
+    ),
+    "everyone": (
+        "<b>Доступно всем:</b>\n"
+        "• <code>/report причина</code> · <code>репорт</code> — жалоба (реплай)\n"
+        "• <code>/profile</code> · <code>профиль</code>\n"
+        "• <code>/me</code> · <code>я</code>\n"
+        "• <code>/join имя</code> · <code>вступить имя</code>\n"
+        "• <code>/leave имя</code> · <code>выйти имя</code>\n"
+        "• <code>/circle_info имя</code> · <code>инфокружка имя</code>\n"
+        "• <code>/help</code> · <code>помощь</code>\n",
+        RANK_USER,
+    ),
+}
+
+
+async def build_help(bot, chat_id: int, user_id: int) -> str:
+    rank = await resolve_rank(bot, chat_id, user_id)
+    lines = [HELP_HEADER]
+    lines.append(f"Твой ранг: <b>{RANK_NAMES.get(rank, '—')}</b>\n\n")
+    for _, (text, min_rank) in HELP_BLOCKS.items():
+        if rank >= min_rank:
+            lines.append(text)
+    return "".join(lines)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if msg is None:
+    user = update.effective_user
+    if msg is None or user is None:
         return
     if msg.chat.type == "private":
-        await safe(msg.reply_text, HELP_TEXT, parse_mode=ParseMode.HTML)
+        await safe(
+            msg.reply_text,
+            "👋 Привет. Добавь меня в группу — там работают все команды.\n"
+            "После добавления напиши <code>/help</code>.",
+            parse_mode=ParseMode.HTML,
+        )
         return
-    await safe(msg.reply_text, "🤖 Бот активен. /help — список команд.")
+    text = await build_help(ctx.bot, msg.chat.id, user.id)
+    await safe(msg.reply_text, text, parse_mode=ParseMode.HTML,
+               disable_web_page_preview=True)
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if msg is None:
+    user = update.effective_user
+    if msg is None or user is None:
         return
-    await safe(msg.reply_text, HELP_TEXT, parse_mode=ParseMode.HTML,
+    if msg.chat.type == "private":
+        await safe(
+            msg.reply_text,
+            "Команды работают только в групповых чатах.\n"
+            "Добавь меня в группу и напиши <code>/help</code> там.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    text = await build_help(ctx.bot, msg.chat.id, user.id)
+    await safe(msg.reply_text, text, parse_mode=ParseMode.HTML,
                disable_web_page_preview=True)
 
 
@@ -897,6 +1000,7 @@ async def cmd_ranks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await safe(msg.reply_text, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
@@ -909,24 +1013,48 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
-        await safe(msg.reply_text,
-                   "Ответь на сообщение и напиши: <code>/setrank junior_mod</code>",
-                   parse_mode=ParseMode.HTML)
+        await eph(msg, "Ответь на сообщение и напиши: <code>/setrank junior_mod</code>",
+                  parse_mode=ParseMode.HTML)
         return
 
     parts = (msg.text or "").split()
     if len(parts) < 2 or parts[1] not in RANK_ALIASES:
-        await safe(msg.reply_text,
-                   "Укажи ранг: " + ", ".join(RANK_ALIASES.keys()),
-                   parse_mode=ParseMode.HTML)
+        await eph(msg, "Укажи ранг: " + ", ".join(RANK_ALIASES.keys()),
+                  parse_mode=ParseMode.HTML)
         return
 
     target = msg.reply_to_message.from_user
     rank = RANK_ALIASES[parts[1]]
     await set_rank(target.id, msg.chat.id, rank)
-    await safe(
-        msg.reply_text,
-        f"✅ {target.mention_html()} → <b>{RANK_NAMES[rank]}</b>",
+    await eph(
+        msg,
+        f"✅ Выдано: {target.mention_html()} → <b>{RANK_NAMES[rank]}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@mod_action
+async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None or msg.chat.type == "private":
+        return
+
+    my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
+    if my_rank < RANK_OWNER:
+        await _rank_error(update, RANK_OWNER, my_rank)
+        return
+
+    if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
+        await eph(msg, "Ответь на сообщение того, у кого нужно снять ранг.",
+                  parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    await set_rank(target.id, msg.chat.id, RANK_USER)
+    await eph(
+        msg,
+        f"✅ Снято: {target.mention_html()} → <b>{RANK_NAMES[RANK_USER]}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -937,6 +1065,7 @@ async def _target_user(msg):
     return None
 
 
+@mod_action
 async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -946,18 +1075,20 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_ADMIN, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await safe(msg.reply_text, "Ответь на сообщение нарушителя."); return
+        await eph(msg, "Ответь на сообщение нарушителя."); return
+    if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
+        await _deny_higher(msg, t.mention_html()); return
     reason = " ".join((msg.text or "").split()[1:]) or "—"
     try:
         await ctx.bot.ban_chat_member(msg.chat.id, t.id)
         await add_blacklist(t.id, msg.chat.id, "banned")
-        await safe(msg.reply_text,
-                   f"🔨 {t.mention_html()} забанен.\nПричина: {esc(reason)}",
-                   parse_mode=ParseMode.HTML)
+        await eph(msg, f"🔨 Готово: {t.mention_html()} забанен.\nПричина: {esc(reason)}",
+                  parse_mode=ParseMode.HTML)
     except Exception as e:
-        await safe(msg.reply_text, f"❌ Ошибка: {esc(e)}")
+        await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@mod_action
 async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -967,18 +1098,19 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_ADMIN, my_rank); return
     parts = (msg.text or "").split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await safe(msg.reply_text, "Использование: /unban &lt;user_id&gt;",
-                   parse_mode=ParseMode.HTML); return
+        await eph(msg, "Использование: <code>/unban user_id</code>",
+                  parse_mode=ParseMode.HTML); return
     uid = int(parts[1])
     try:
         await ctx.bot.unban_chat_member(msg.chat.id, uid)
         await remove_blacklist(uid, msg.chat.id)
-        await safe(msg.reply_text, f"✅ Разбанен <code>{uid}</code>",
-                   parse_mode=ParseMode.HTML)
+        await eph(msg, f"✅ Готово: <code>{uid}</code> разбанен.",
+                  parse_mode=ParseMode.HTML)
     except Exception as e:
-        await safe(msg.reply_text, f"❌ Ошибка: {esc(e)}")
+        await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@mod_action
 async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -988,16 +1120,19 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await safe(msg.reply_text, "Ответь на сообщение."); return
+        await eph(msg, "Ответь на сообщение."); return
+    if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
+        await _deny_higher(msg, t.mention_html()); return
     try:
         await ctx.bot.ban_chat_member(msg.chat.id, t.id)
         await ctx.bot.unban_chat_member(msg.chat.id, t.id)
-        await safe(msg.reply_text, f"👢 {t.mention_html()} кикнут.",
-                   parse_mode=ParseMode.HTML)
+        await eph(msg, f"👢 Готово: {t.mention_html()} кикнут.",
+                  parse_mode=ParseMode.HTML)
     except Exception as e:
-        await safe(msg.reply_text, f"❌ Ошибка: {esc(e)}")
+        await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@mod_action
 async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1007,7 +1142,9 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await safe(msg.reply_text, "Ответь на сообщение."); return
+        await eph(msg, "Ответь на сообщение."); return
+    if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
+        await _deny_higher(msg, t.mention_html()); return
     parts = (msg.text or "").split()
     secs = parse_duration(parts[1]) if len(parts) > 1 else 600
     if secs <= 0:
@@ -1018,13 +1155,14 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             until_date=int(time.time()) + secs,
         )
         await set_mute(t.id, msg.chat.id, None)
-        await safe(msg.reply_text,
-                   f"🔇 {t.mention_html()} замучен на {fmt_seconds(secs)}.",
-                   parse_mode=ParseMode.HTML)
+        await eph(msg,
+                  f"🔇 Готово: {t.mention_html()} замучен на {fmt_seconds(secs)}.",
+                  parse_mode=ParseMode.HTML)
     except Exception as e:
-        await safe(msg.reply_text, f"❌ Ошибка: {esc(e)}")
+        await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@mod_action
 async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1034,16 +1172,19 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await safe(msg.reply_text, "Ответь на сообщение."); return
+        await eph(msg, "Ответь на сообщение."); return
+    if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
+        await _deny_higher(msg, t.mention_html()); return
     try:
         await ctx.bot.restrict_chat_member(msg.chat.id, t.id, UNMUTE_PERMS)
         await set_mute(t.id, msg.chat.id, None)
-        await safe(msg.reply_text, f"🔊 {t.mention_html()} размучен.",
-                   parse_mode=ParseMode.HTML)
+        await eph(msg, f"🔊 Готово: {t.mention_html()} размучен.",
+                  parse_mode=ParseMode.HTML)
     except Exception as e:
-        await safe(msg.reply_text, f"❌ Ошибка: {esc(e)}")
+        await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@mod_action
 async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1053,11 +1194,12 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await safe(msg.reply_text, "Ответь на сообщение."); return
+        await eph(msg, "Ответь на сообщение."); return
+    if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
+        await _deny_higher(msg, t.mention_html()); return
     total = await add_warn(t.id, msg.chat.id)
-    await safe(msg.reply_text,
-               f"⚠️ {t.mention_html()} — предупреждение ({total}/3).",
-               parse_mode=ParseMode.HTML)
+    await eph(msg, f"⚠️ Готово: {t.mention_html()} — предупреждение ({total}/3).",
+              parse_mode=ParseMode.HTML)
     if total >= 3:
         try:
             await ctx.bot.restrict_chat_member(
@@ -1065,13 +1207,13 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 until_date=int(time.time()) + 3600,
             )
             await reset_warns(t.id, msg.chat.id)
-            await safe(msg.reply_text,
-                       f"🔇 {t.mention_html()} — авто-мут на 1 час (3/3).",
-                       parse_mode=ParseMode.HTML)
+            await eph(msg, f"🔇 {t.mention_html()} — авто-мут на 1 час (3/3).",
+                      parse_mode=ParseMode.HTML)
         except Exception as e:
             log.debug("auto-mute fail: %s", e)
 
 
+@mod_action
 async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1081,12 +1223,15 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await safe(msg.reply_text, "Ответь на сообщение."); return
+        await eph(msg, "Ответь на сообщение."); return
+    if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
+        await _deny_higher(msg, t.mention_html()); return
     await reset_warns(t.id, msg.chat.id)
-    await safe(msg.reply_text, f"♻️ Предупреждения {t.mention_html()} сброшены.",
-               parse_mode=ParseMode.HTML)
+    await eph(msg, f"♻️ Готово: предупреждения {t.mention_html()} сброшены.",
+              parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_warns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None:
@@ -1094,11 +1239,11 @@ async def cmd_warns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = await _target_user(msg) or user
     row = await get_user(t.id, msg.chat.id)
     warns = row["warns"] if row else 0
-    await safe(msg.reply_text,
-               f"⚠️ {t.mention_html()}: {warns}/3 предупреждений.",
-               parse_mode=ParseMode.HTML)
+    await eph(msg, f"⚠️ {t.mention_html()}: {warns}/3 предупреждений.",
+              parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1108,14 +1253,16 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await safe(msg.reply_text, "Ответь на сообщение и напиши /mod"); return
-    await safe(
+        await eph(msg, "Ответь на сообщение и напиши /mod"); return
+    sent = await safe(
         msg.reply_text,
         f"🛡 <b>Модерация</b>\n"
         f"Цель: {t.mention_html()} (<code>{t.id}</code>)",
         parse_mode=ParseMode.HTML,
         reply_markup=mod_kb(msg.chat.id, t.id),
     )
+    if sent is not None:
+        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, sent.message_id, 60.0))
 
 
 async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1130,12 +1277,17 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     required = RANK_JUNIOR_ADMIN if action in ("ban", "kick") else RANK_JUNIOR_MOD
     rank_here = await resolve_rank(ctx.bot, q.message.chat.id, q.from_user.id)
-    rank_target = await resolve_rank(ctx.bot, chat_id, q.from_user.id)
-    my_rank = max(rank_here, rank_target)
+    rank_target_chat = await resolve_rank(ctx.bot, chat_id, q.from_user.id)
+    my_rank = max(rank_here, rank_target_chat)
     if my_rank < required:
         await safe(q.answer,
                    f"⛔ Нужен {RANK_NAMES.get(required)}", show_alert=True)
         return
+
+    if action in ("ban", "kick", "mute", "warn", "unmute", "unwarn"):
+        if not await can_act_on(ctx.bot, chat_id, q.from_user.id, target_id):
+            await safe(q.answer, "⛔ Его ранг не ниже твоего.", show_alert=True)
+            return
 
     try:
         member = await ctx.bot.get_chat_member(chat_id, target_id)
@@ -1157,7 +1309,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await reset_warns(target_id, chat_id)
                 result += " → 🔇 авто-мут 1ч"
             except Exception as e:
-                result += f" (mute fail: {esc(e)})"
+                result += f" (мут не удался: {esc(e)})"
 
     elif action == "mute":
         try:
@@ -1168,7 +1320,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await set_mute(target_id, chat_id, None)
             result = f"🔇 {mention} — мут 30 мин"
         except Exception as e:
-            result = f"❌ mute: {esc(e)}"
+            result = f"❌ мут: {esc(e)}"
 
     elif action == "kick":
         try:
@@ -1176,7 +1328,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.unban_chat_member(chat_id, target_id)
             result = f"👢 {mention} — кикнут"
         except Exception as e:
-            result = f"❌ kick: {esc(e)}"
+            result = f"❌ кик: {esc(e)}"
 
     elif action == "ban":
         try:
@@ -1184,7 +1336,15 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await add_blacklist(target_id, chat_id, "banned_via_button")
             result = f"🔨 {mention} — забанен"
         except Exception as e:
-            result = f"❌ ban: {esc(e)}"
+            result = f"❌ бан: {esc(e)}"
+
+    elif action == "unban":
+        try:
+            await ctx.bot.unban_chat_member(chat_id, target_id)
+            await remove_blacklist(target_id, chat_id)
+            result = f"🔓 {mention} — разбанен"
+        except Exception as e:
+            result = f"❌ разбан: {esc(e)}"
 
     elif action == "unmute":
         try:
@@ -1192,7 +1352,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await set_mute(target_id, chat_id, None)
             result = f"🔊 {mention} — размучен"
         except Exception as e:
-            result = f"❌ unmute: {esc(e)}"
+            result = f"❌ размут: {esc(e)}"
 
     elif action == "unwarn":
         await reset_warns(target_id, chat_id)
@@ -1204,8 +1364,8 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         rank_val = await resolve_rank(ctx.bot, chat_id, target_id)
         circles = await circles_of_user(chat_id, target_id)
         circle_names = ", ".join(c["name"] for c in circles) if circles else "—"
-        await safe(
-            q.message.reply_text,
+        note = await safe(
+            ctx.bot.send_message, chat_id,
             f"👤 <b>Профиль</b>\n"
             f"{mention}\n"
             f"ID: <code>{target_id}</code>\n"
@@ -1214,6 +1374,8 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"👥 Кружки: {circle_names}",
             parse_mode=ParseMode.HTML,
         )
+        if note is not None:
+            asyncio.create_task(_del_later(ctx.bot, chat_id, note.message_id, 15.0))
         await safe(q.answer, "Профиль отправлен")
         return
 
@@ -1223,15 +1385,18 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = "✅ Репорт закрыт"
 
     try:
-        if action in ("ban", "kick") or action == "close":
+        if action in ("ban", "kick", "unban") or action == "close":
             await safe(q.message.edit_reply_markup, reply_markup=None)
     except Exception:
         pass
 
-    await safe(q.message.reply_text, result, parse_mode=ParseMode.HTML)
+    note = await safe(q.message.reply_text, result, parse_mode=ParseMode.HTML)
+    if note is not None:
+        asyncio.create_task(_del_later(ctx.bot, note.chat.id, note.message_id, EPHEMERAL_DELAY))
     await safe(q.answer, "Готово")
 
 
+@mod_action
 async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1242,8 +1407,8 @@ async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     parts = (msg.text or "").split()
     if len(parts) < 2:
-        await safe(
-            msg.reply_text,
+        await eph(
+            msg,
             "<b>Управление триггерами</b>\n"
             "<code>/trigger add слово [warn|mute|kick|ban]</code>\n"
             "<code>/trigger del слово</code>\n"
@@ -1258,24 +1423,23 @@ async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         word = parts[2].lower()
         action = parts[3].lower() if len(parts) > 3 else "warn"
         if action not in ("warn", "mute", "kick", "ban"):
-            await safe(msg.reply_text, "Действия: warn / mute / kick / ban"); return
+            await eph(msg, "Действия: warn / mute / kick / ban"); return
         await add_trigger(msg.chat.id, word, action)
-        await safe(msg.reply_text,
-                   f"✅ Триггер <code>{esc(word)}</code> → <b>{action}</b>",
-                   parse_mode=ParseMode.HTML)
+        await eph(msg, f"✅ Триггер <code>{esc(word)}</code> → <b>{action}</b>",
+                  parse_mode=ParseMode.HTML)
 
     elif sub == "del" and len(parts) >= 3:
         await del_trigger(msg.chat.id, parts[2].lower())
-        await safe(msg.reply_text, "🗑 Триггер удалён.")
+        await eph(msg, "🗑 Триггер удалён.")
 
     elif sub == "list":
         rows = await list_triggers(msg.chat.id)
         if not rows:
-            await safe(msg.reply_text, "Триггеров нет."); return
+            await eph(msg, "Триггеров нет."); return
         txt = "\n".join(f"• <code>{esc(r['word'])}</code> → {r['action']}" for r in rows)
-        await safe(msg.reply_text, f"<b>Триггеры:</b>\n{txt}", parse_mode=ParseMode.HTML)
+        await eph(msg, f"<b>Триггеры:</b>\n{txt}", parse_mode=ParseMode.HTML)
     else:
-        await safe(msg.reply_text, "Некорректно. См. /help")
+        await eph(msg, "Некорректно. См. /help")
 
 
 async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1288,9 +1452,8 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await safe(msg.reply_text,
-                   "Использование: <code>/create_circle Название</code>",
-                   parse_mode=ParseMode.HTML)
+        await eph(msg, "Использование: <code>/create_circle Название</code>",
+                  parse_mode=ParseMode.HTML)
         return
 
     name = parts[1].strip()[:60]
@@ -1298,19 +1461,17 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     existing = await get_circle_by_thread(msg.chat.id, thread_id)
     if existing:
-        await safe(msg.reply_text,
-                   f"В этой теме уже есть кружок: <b>{esc(existing['name'])}</b>",
-                   parse_mode=ParseMode.HTML)
+        await eph(msg, f"В этой теме уже есть кружок: <b>{esc(existing['name'])}</b>",
+                  parse_mode=ParseMode.HTML)
         return
 
     cid = await create_circle(msg.chat.id, name, user.id, thread_id)
     await add_circle_member(cid, user.id)
-    await safe(
-        msg.reply_text,
-        f"✅ Кружок <b>{esc(name)}</b> создан.\n"
-        f"Вступить: <code>/join {esc(name)}</code>",
-        parse_mode=ParseMode.HTML,
-    )
+    await safe(msg.reply_text,
+               f"✅ Кружок <b>{esc(name)}</b> создан.\n"
+               f"Вступить: <code>/join {esc(name)}</code>",
+               parse_mode=ParseMode.HTML)
+    await safe(ctx.bot.delete_message, msg.chat.id, msg.message_id)
 
 
 async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1319,15 +1480,13 @@ async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await safe(msg.reply_text, "Использование: <code>/join Название</code>",
-                   parse_mode=ParseMode.HTML); return
+        await eph(msg, "Использование: <code>/join Название</code>",
+                  parse_mode=ParseMode.HTML); return
     c = await get_circle_by_name(msg.chat.id, parts[1].strip())
     if not c:
-        await safe(msg.reply_text, "Кружок не найден."); return
+        await eph(msg, "Кружок не найден."); return
     await add_circle_member(c["id"], user.id)
-    await safe(msg.reply_text,
-               f"✅ Ты в кружке <b>{esc(c['name'])}</b>.",
-               parse_mode=ParseMode.HTML)
+    await eph(msg, f"✅ Ты в кружке <b>{esc(c['name'])}</b>.", parse_mode=ParseMode.HTML)
 
 
 async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1336,14 +1495,13 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await safe(msg.reply_text, "Использование: <code>/leave Название</code>",
-                   parse_mode=ParseMode.HTML); return
+        await eph(msg, "Использование: <code>/leave Название</code>",
+                  parse_mode=ParseMode.HTML); return
     c = await get_circle_by_name(msg.chat.id, parts[1].strip())
     if not c:
-        await safe(msg.reply_text, "Кружок не найден."); return
+        await eph(msg, "Кружок не найден."); return
     await remove_circle_member(c["id"], user.id)
-    await safe(msg.reply_text, f"🚪 Ты вышел из <b>{esc(c['name'])}</b>.",
-               parse_mode=ParseMode.HTML)
+    await eph(msg, f"🚪 Ты вышел из <b>{esc(c['name'])}</b>.", parse_mode=ParseMode.HTML)
 
 
 async def cmd_circle_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1352,11 +1510,11 @@ async def cmd_circle_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await safe(msg.reply_text, "Использование: <code>/circle_info Название</code>",
-                   parse_mode=ParseMode.HTML); return
+        await eph(msg, "Использование: <code>/circle_info Название</code>",
+                  parse_mode=ParseMode.HTML); return
     c = await get_circle_by_name(msg.chat.id, parts[1].strip())
     if not c:
-        await safe(msg.reply_text, "Кружок не найден."); return
+        await eph(msg, "Кружок не найден."); return
     members = await circle_members(c["id"])
     lines = [f"👥 <b>{esc(c['name'])}</b> — {len(members)} участн."]
     for row in members[:50]:
@@ -1369,6 +1527,7 @@ async def cmd_circle_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await safe(msg.reply_text, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_delete_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1378,18 +1537,18 @@ async def cmd_delete_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await safe(msg.reply_text, "Использование: <code>/delete_circle Название</code>",
-                   parse_mode=ParseMode.HTML); return
+        await eph(msg, "Использование: <code>/delete_circle Название</code>",
+                  parse_mode=ParseMode.HTML); return
     c = await get_circle_by_name(msg.chat.id, parts[1].strip())
     if not c:
-        await safe(msg.reply_text, "Кружок не найден."); return
+        await eph(msg, "Кружок не найден."); return
     if c["owner_id"] != user.id and my_rank < RANK_SENIOR_ADMIN:
-        await safe(msg.reply_text, "Только владелец кружка или старший админ."); return
+        await eph(msg, "Только владелец кружка или старший админ."); return
     await delete_circle(c["id"])
-    await safe(msg.reply_text, f"🗑 Кружок <b>{esc(c['name'])}</b> удалён.",
-               parse_mode=ParseMode.HTML)
+    await eph(msg, f"🗑 Кружок <b>{esc(c['name'])}</b> удалён.", parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1416,10 +1575,6 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     await forget_messages(msg.chat.id, ids)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
     note_kwargs = {"message_thread_id": thread_id} if thread_id else {}
     note = await safe(
         ctx.bot.send_message, msg.chat.id,
@@ -1427,10 +1582,10 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         **note_kwargs,
     )
     if note is not None:
-        await asyncio.sleep(5)
-        await safe(ctx.bot.delete_message, msg.chat.id, note.message_id)
+        asyncio.create_task(_del_later(ctx.bot, msg.chat.id, note.message_id, 5.0))
 
 
+@mod_action
 async def cmd_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1442,16 +1597,15 @@ async def cmd_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = (msg.text or "").split()
     arg = parts[1].lower() if len(parts) > 1 else ""
     if arg not in ("on", "off"):
-        await safe(msg.reply_text,
-                   "Использование: <code>/links on</code> или <code>/links off</code>",
-                   parse_mode=ParseMode.HTML); return
+        await eph(msg, "Использование: <code>/links on</code> или <code>/links off</code>",
+                  parse_mode=ParseMode.HTML); return
 
     thread_id = msg.message_thread_id or 0
     allowed = (arg == "on")
     await set_topic_links(msg.chat.id, thread_id, allowed)
-    await safe(msg.reply_text,
-               f"🔗 Ссылки в этой теме: <b>{'разрешены' if allowed else 'запрещены'}</b>",
-               parse_mode=ParseMode.HTML)
+    await eph(msg,
+              f"🔗 Ссылки в этой теме: <b>{'разрешены' if allowed else 'запрещены'}</b>",
+              parse_mode=ParseMode.HTML)
 
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1501,8 +1655,11 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     if sent is None:
         await safe(msg.reply_text, "⚠️ Не смог отправить, попробуй позже."); return
-    await safe(msg.reply_text, "✅ Жалоба отправлена модераторам.",
-               disable_notification=True)
+    note = await safe(msg.reply_text, "✅ Жалоба отправлена модераторам.",
+                      disable_notification=True)
+    if note is not None:
+        asyncio.create_task(_del_later(ctx.bot, note.chat.id, note.message_id, EPHEMERAL_DELAY))
+    await safe(ctx.bot.delete_message, msg.chat.id, msg.message_id)
 
 
 async def _build_profile(ctx, chat_id: int, target) -> str:
@@ -1555,6 +1712,7 @@ async def cmd_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                parse_mode=ParseMode.HTML)
 
 
+@mod_action
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
@@ -1566,8 +1724,8 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if len(parts) == 1:
         s = await get_settings(msg.chat.id)
-        await safe(
-            msg.reply_text,
+        await eph(
+            msg,
             f"<b>Настройки чата</b>\n"
             f"Антиспам: <b>{'вкл' if s['antispam'] else 'выкл'}</b>\n"
             f"Антирейд: <b>{'вкл' if s['antiraid'] else 'выкл'}</b>\n"
@@ -1585,24 +1743,24 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if key in ("antispam", "antiraid") and len(parts) > 2:
         val = 1 if parts[2].lower() in ("on", "1", "вкл") else 0
         await set_setting(msg.chat.id, key, val)
-        await safe(msg.reply_text, f"✅ {key} → {'on' if val else 'off'}")
+        await eph(msg, f"✅ {key} → {'вкл' if val else 'выкл'}")
     elif key == "flood" and len(parts) > 3:
         try:
             n, w = int(parts[2]), int(parts[3])
         except ValueError:
-            await safe(msg.reply_text, "Числа нужны."); return
+            await eph(msg, "Числа нужны."); return
         await set_setting(msg.chat.id, "flood_limit", n)
         await set_setting(msg.chat.id, "flood_window", w)
-        await safe(msg.reply_text, f"✅ flood → {n}/{w}с")
+        await eph(msg, f"✅ flood → {n}/{w}с")
     elif key == "mute" and len(parts) > 2:
         try:
             m = int(parts[2])
         except ValueError:
-            await safe(msg.reply_text, "Число нужно."); return
+            await eph(msg, "Число нужно."); return
         await set_setting(msg.chat.id, "mute_minutes", m)
-        await safe(msg.reply_text, f"✅ mute → {m} мин")
+        await eph(msg, f"✅ mute → {m} мин")
     else:
-        await safe(msg.reply_text, "См. /settings")
+        await eph(msg, "См. /settings")
 
 
 async def _post_init(app: Application):
@@ -1629,6 +1787,35 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error in handler:", exc_info=err)
 
 
+RU_ALIASES = [
+    (r"^бан(?:\s|$)",              cmd_ban),
+    (r"^разбан(?:\s|$)",           cmd_unban),
+    (r"^кик(?:\s|$)",              cmd_kick),
+    (r"^мут(?:\s|$)",              cmd_mute),
+    (r"^размут(?:\s|$)",           cmd_unmute),
+    (r"^варн(?:\s|$)",             cmd_warn),
+    (r"^анварн(?:\s|$)",           cmd_unwarn),
+    (r"^варны(?:\s|$)",            cmd_warns),
+    (r"^мод(?:\s|$)",              cmd_mod),
+    (r"^репорт(?:\s|$)",           cmd_report),
+    (r"^профиль(?:\s|$)",          cmd_profile),
+    (r"^я$",                       cmd_me),
+    (r"^помощь(?:\s|$)",           cmd_help),
+    (r"^ранги(?:\s|$)",            cmd_ranks),
+    (r"^чистка(?:\s|$)",           cmd_clean),
+    (r"^ссылки(?:\s|$)",           cmd_links),
+    (r"^выдатьранг(?:\s|$)",       cmd_setrank),
+    (r"^снятьранг(?:\s|$)",        cmd_unrank),
+    (r"^создатькружок(?:\s|$)",    cmd_create_circle),
+    (r"^вступить(?:\s|$)",         cmd_join),
+    (r"^выйти(?:\s|$)",            cmd_leave),
+    (r"^инфокружка(?:\s|$)",       cmd_circle_info),
+    (r"^удалитькружок(?:\s|$)",    cmd_delete_circle),
+    (r"^триггер(?:\s|$)",          cmd_trigger),
+    (r"^настройки(?:\s|$)",        cmd_settings),
+]
+
+
 async def _build_app() -> Application:
     app = (
         Application.builder()
@@ -1645,10 +1832,10 @@ async def _build_app() -> Application:
 
     G = filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
 
-    app.add_handler(MessageHandler(G, pre_remember), group=-2)
+    app.add_handler(MessageHandler(G, pre_remember), group=-4)
 
-    app.add_handler(MessageHandler(G & ~filters.COMMAND, antispam_mw), group=-1)
-    app.add_handler(MessageHandler(G & (filters.TEXT | filters.CAPTION), link_guard_mw), group=-1)
+    app.add_handler(MessageHandler(G & ~filters.COMMAND, antispam_mw), group=-3)
+    app.add_handler(MessageHandler(G & (filters.TEXT | filters.CAPTION), link_guard_mw), group=-2)
     app.add_handler(MessageHandler(G & (filters.TEXT | filters.CAPTION), trigger_mw), group=-1)
 
     app.add_handler(ChatMemberHandler(antiraid_track, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
@@ -1660,6 +1847,7 @@ async def _build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ranks", cmd_ranks))
     app.add_handler(CommandHandler("setrank", cmd_setrank, filters=G))
+    app.add_handler(CommandHandler("unrank", cmd_unrank, filters=G))
 
     app.add_handler(CommandHandler("ban", cmd_ban, filters=G))
     app.add_handler(CommandHandler("unban", cmd_unban, filters=G))
@@ -1688,6 +1876,12 @@ async def _build_app() -> Application:
     app.add_handler(CommandHandler("me", cmd_me, filters=G))
 
     app.add_handler(CommandHandler("settings", cmd_settings, filters=G))
+
+    for pattern, handler in RU_ALIASES:
+        app.add_handler(MessageHandler(
+            G & filters.TEXT & filters.Regex(pattern),
+            handler,
+        ))
 
     app.add_error_handler(_error_handler)
     return app
