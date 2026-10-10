@@ -396,6 +396,19 @@ def fmt_seconds(sec: int) -> str:
     return f"{sec}с"
 
 
+def _parse_cmd_time(tok: str) -> Optional[int]:
+    """Строгий парсер: '30с'→30, '1ч'→3600, '0'/'вечно'→0, иначе None."""
+    if not tok:
+        return None
+    t = tok.strip().lower()
+    if t in ("0", "вечно", "навсегда", "forever", "inf"):
+        return 0
+    secs = parse_duration(t)
+    if secs > 0:
+        return secs
+    return None
+
+
 LINK_RE = re.compile(r"(https?://|t\.me/|telegram\.me/|@[A-Za-z0-9_]{5,})", re.IGNORECASE)
 
 
@@ -532,6 +545,7 @@ SETTINGS_MIGRATIONS = [
     ("default_ban_sec",   "INTEGER NOT NULL DEFAULT 0"),
     ("trig_warn_sec",     "INTEGER NOT NULL DEFAULT 0"),
     ("trig_ban_sec",      "INTEGER NOT NULL DEFAULT 0"),
+    ("link_action",       "TEXT NOT NULL DEFAULT 'none'"),
 ]
 
 
@@ -934,6 +948,15 @@ async def _rank_error(update: Update, min_rank: int, rank: int):
     )
 
 
+async def _rank_denied(update: Update, min_rank: int, my_rank: int) -> bool:
+    """True = стоп. Юзеру (без ранга) — полная тишина, модератору — ошибка."""
+    if my_rank >= min_rank:
+        return False
+    if my_rank >= RANK_JUNIOR_MOD:
+        await _rank_error(update, min_rank, my_rank)
+    return True
+
+
 async def _deny_higher(msg, target_mention: str, target_rank: int = -1):
     return
 
@@ -1038,6 +1061,44 @@ async def _ban_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
     except Exception as e:
         log.debug("_ban_user fail: %s", e)
         return False
+
+
+async def _apply_warn_limit_action(bot, chat_id: int, user, settings):
+    uid = user.id
+    warn_limit = int(_s(settings, "warn_limit", 3))
+    auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
+    default_ban = int(_s(settings, "default_ban_sec", 0))
+    warn_action = str(_s(settings, "warn_action", "ban")).lower()
+    try:
+        if warn_action == "ban":
+            await _ban_user(bot, chat_id, uid, default_ban)
+            await add_blacklist(uid, chat_id, "auto_ban_warns")
+            await reset_warns(uid, chat_id)
+            tail = f" на {fmt_seconds(default_ban)}" if default_ban > 0 else ""
+            await log_action(bot, None,
+                             f"🔨 Авто-бан{tail} ({warn_limit}/{warn_limit} варнов)",
+                             user, "", chat_id)
+            return f"🔨 забанен{tail}"
+        elif warn_action == "kick":
+            await bot.ban_chat_member(chat_id, uid)
+            await bot.unban_chat_member(chat_id, uid)
+            await reset_warns(uid, chat_id)
+            await log_action(bot, None,
+                             f"👢 Авто-кик ({warn_limit}/{warn_limit} варнов)",
+                             user, "", chat_id)
+            return "👢 кикнут"
+        else:
+            ok = await _mute_user(bot, chat_id, uid, auto_mute_sec)
+            if ok:
+                await reset_warns(uid, chat_id)
+                tail = f" на {fmt_seconds(auto_mute_sec)}" if auto_mute_sec > 0 else " навсегда"
+                await log_action(bot, None,
+                                 f"🔇 Авто-мут{tail} ({warn_limit}/{warn_limit} варнов)",
+                                 user, "", chat_id)
+                return f"🔇 мут{tail}"
+    except Exception as e:
+        log.debug("apply_warn_limit_action: %s", e)
+    return ""
 
 
 async def _punishment_sweeper(app: Application):
@@ -1221,11 +1282,62 @@ async def link_guard_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await safe(msg.delete)
-    await eph(
-        msg,
-        "🚫 Ссылки в этом чате запрещены.",
-        disable_notification=True,
-    )
+
+    link_action = str(_s(settings, "link_action", "none")).lower()
+    warn_limit = int(_s(settings, "warn_limit", 3))
+    auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
+    default_warn_sec = int(_s(settings, "default_warn_sec", 0))
+    default_ban_sec = int(_s(settings, "default_ban_sec", 0))
+
+    notice = "🚫 Ссылки в этом чате запрещены."
+
+    if link_action in ("none", "", None):
+        await eph(msg, notice, disable_notification=True)
+        raise ApplicationHandlerStop
+
+    uid = user.id
+    mention = user.mention_html()
+
+    if link_action == "warn":
+        total = await add_warn_with_ttl(uid, msg.chat.id, default_warn_sec)
+        ttl_txt = f" на {fmt_seconds(default_warn_sec)}" if default_warn_sec > 0 else ""
+        notice += f"\n⚠️ {mention} — предупреждение{ttl_txt} ({total}/{warn_limit})."
+        await log_action(ctx.bot, None,
+                         f"⚠️ Авто-варн за ссылку{ttl_txt} ({total}/{warn_limit})",
+                         user, "", msg.chat.id, reply_msg_id=msg.message_id)
+        if total >= warn_limit:
+            result = await _apply_warn_limit_action(ctx.bot, msg.chat.id, user, settings)
+            if result:
+                notice += f"\n{result}"
+
+    elif link_action == "mute":
+        ok = await _mute_user(ctx.bot, msg.chat.id, uid, auto_mute_sec)
+        if ok:
+            ttl = f" на {fmt_seconds(auto_mute_sec)}" if auto_mute_sec > 0 else " навсегда"
+            notice += f"\n🔇 {mention} — мут{ttl}."
+            await log_action(ctx.bot, None, f"🔇 Авто-мут за ссылку{ttl}",
+                             user, "", msg.chat.id, reply_msg_id=msg.message_id)
+
+    elif link_action == "kick":
+        try:
+            await ctx.bot.ban_chat_member(msg.chat.id, uid)
+            await ctx.bot.unban_chat_member(msg.chat.id, uid)
+            notice += f"\n👢 {mention} — кикнут."
+            await log_action(ctx.bot, None, "👢 Авто-кик за ссылку",
+                             user, "", msg.chat.id, reply_msg_id=msg.message_id)
+        except Exception as e:
+            log.debug("link kick fail: %s", e)
+
+    elif link_action == "ban":
+        ok = await _ban_user(ctx.bot, msg.chat.id, uid, default_ban_sec)
+        if ok:
+            await add_blacklist(uid, msg.chat.id, "auto_ban_links")
+            ttl = f" на {fmt_seconds(default_ban_sec)}" if default_ban_sec > 0 else " навсегда"
+            notice += f"\n🔨 {mention} — забанен{ttl}."
+            await log_action(ctx.bot, None, f"🔨 Авто-бан за ссылку{ttl}",
+                             user, "", msg.chat.id, reply_msg_id=msg.message_id)
+
+    await eph(msg, notice, disable_notification=True)
     raise ApplicationHandlerStop
 
 
@@ -1651,8 +1763,7 @@ async def cmd_ranks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank)
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
         return
     await eph(
         msg,
@@ -1669,8 +1780,7 @@ async def cmd_roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_SENIOR_ADMIN:
-        await _rank_error(update, RANK_SENIOR_ADMIN, my_rank)
+    if await _rank_denied(update, RANK_SENIOR_ADMIN, my_rank):
         return
 
     chat_id = msg.chat.id
@@ -1773,35 +1883,18 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_SENIOR_ADMIN:
-        await _rank_error(update, RANK_SENIOR_ADMIN, my_rank)
+    if await _rank_denied(update, RANK_SENIOR_ADMIN, my_rank):
         return
 
-    target = msg.reply_to_message.from_user
-
     parts = (msg.text or "").split()
-    if len(parts) < 2:
-        await eph(
-            msg,
-            "❌ Не указан ранг.\n\n"
-            "Пример: <code>выдатьранг мл_мод</code>\n\n"
-            "Доступные ранги:\n" + RANK_HINTS,
-            parse_mode=ParseMode.HTML,
-        )
+    if len(parts) != 2:
         return
 
     key = parts[1].lower().strip()
     if key not in RANK_ALIASES:
-        await eph(
-            msg,
-            f"❌ Ранг <code>{esc(key)}</code> не найден.\n\n"
-            "Доступные ранги:\n" + RANK_HINTS,
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     rank = RANK_ALIASES[key]
-
     if rank >= my_rank:
         await eph(
             msg,
@@ -1811,6 +1904,7 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    target = msg.reply_to_message.from_user
     target_rank = await resolve_rank(ctx.bot, msg.chat.id, target.id)
     if target_rank >= my_rank:
         tr = RANK_NAMES.get(target_rank, "—")
@@ -1844,12 +1938,14 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_SENIOR_ADMIN:
-        await _rank_error(update, RANK_SENIOR_ADMIN, my_rank)
+    if await _rank_denied(update, RANK_SENIOR_ADMIN, my_rank):
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) != 1:
         return
 
     target = msg.reply_to_message.from_user
-
     target_rank = await resolve_rank(ctx.bot, msg.chat.id, target.id)
     if target_rank >= my_rank:
         tr = RANK_NAMES.get(target_rank, "—")
@@ -1879,32 +1975,38 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_ADMIN:
-        await _rank_error(update, RANK_JUNIOR_ADMIN, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_ADMIN, my_rank):
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) == 1:
+        parsed = None
+    elif len(parts) == 2:
+        parsed = _parse_cmd_time(parts[1])
+        if parsed is None:
+            return
+    else:
+        parsed = _parse_cmd_time(parts[1])
+        if parsed is None:
+            return
+
     t = await _target_user(msg)
     if not t:
         return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
-        await _deny_higher(msg, t.mention_html(), tr); return
+        return
 
     settings = await get_settings(msg.chat.id)
     default_ban = int(_s(settings, "default_ban_sec", 0))
 
-    parts = (msg.text or "").split()
-    secs = 0
-    reason = "—"
-    if len(parts) > 1:
-        maybe = parse_setting_time(parts[1])
-        if maybe > 0:
-            secs = maybe
-            reason = " ".join(parts[2:]).strip() or "—"
-        else:
-            reason = " ".join(parts[1:]).strip() or "—"
-    if secs <= 0:
+    if len(parts) == 1:
         secs = default_ban
+        reason = "—"
+    else:
+        secs = parsed if parsed is not None else 0
+        reason = " ".join(parts[2:]).strip() or "—"
 
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     ok = await _ban_user(ctx.bot, msg.chat.id, t.id, secs)
@@ -1929,8 +2031,12 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_ADMIN:
-        await _rank_error(update, RANK_JUNIOR_ADMIN, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_ADMIN, my_rank):
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) != 1:
+        return
 
     t = await _target_user(msg)
     if not t:
@@ -1964,16 +2070,21 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) != 1:
+        return
+
     t = await _target_user(msg)
     if not t:
         return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
-        await _deny_higher(msg, t.mention_html(), tr); return
+        return
+
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
         await ctx.bot.ban_chat_member(msg.chat.id, t.id)
@@ -1992,24 +2103,33 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) == 1:
+        parsed = None
+    elif len(parts) == 2:
+        parsed = _parse_cmd_time(parts[1])
+        if parsed is None:
+            return
+    else:
+        return
+
     t = await _target_user(msg)
     if not t:
         return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
-        await _deny_higher(msg, t.mention_html(), tr); return
-    parts = (msg.text or "").split()
-    if len(parts) > 1:
-        secs = parse_duration(parts[1])
-        if secs <= 0:
-            secs = parse_setting_time(parts[1])
-    else:
-        settings = await get_settings(msg.chat.id)
+        return
+
+    settings = await get_settings(msg.chat.id)
+    if len(parts) == 1:
         secs = int(_s(settings, "default_mute_sec", 600))
+    else:
+        secs = parsed if parsed is not None else 0
+
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     ok = await _mute_user(ctx.bot, msg.chat.id, t.id, secs)
     if ok:
@@ -2029,16 +2149,20 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) != 1:
+        return
+
     t = await _target_user(msg)
     if not t:
         return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
-        await _deny_higher(msg, t.mention_html(), tr); return
+        return
 
     if not await _is_muted(ctx.bot, msg.chat.id, t.id):
         await eph(msg, f"ℹ️ {t.mention_html()} не в муте — снимать нечего.",
@@ -2063,29 +2187,35 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) == 1:
+        parsed = None
+    elif len(parts) == 2:
+        parsed = _parse_cmd_time(parts[1])
+        if parsed is None:
+            return
+    else:
+        return
+
     t = await _target_user(msg)
     if not t:
         return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
-        await _deny_higher(msg, t.mention_html(), tr); return
+        return
 
     settings = await get_settings(msg.chat.id)
     warn_limit = int(_s(settings, "warn_limit", 3))
-    auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
     default_warn = int(_s(settings, "default_warn_sec", 0))
-    default_ban = int(_s(settings, "default_ban_sec", 0))
 
-    parts = (msg.text or "").split()
-    secs = 0
-    if len(parts) > 1:
-        secs = parse_setting_time(parts[1])
-    if secs <= 0:
+    if len(parts) == 1:
         secs = default_warn
+    else:
+        secs = parsed if parsed is not None else 0
 
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     total = await add_warn_with_ttl(t.id, msg.chat.id, secs)
@@ -2097,39 +2227,9 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               parse_mode=ParseMode.HTML)
 
     if total >= warn_limit:
-        warn_action = str(_s(settings, "warn_action", "ban")).lower()
-        try:
-            if warn_action == "ban":
-                await _ban_user(ctx.bot, msg.chat.id, t.id, default_ban)
-                await add_blacklist(t.id, msg.chat.id, "auto_ban_warns")
-                await reset_warns(t.id, msg.chat.id)
-                await log_action(ctx.bot, user,
-                                 f"🔨 Авто-бан ({warn_limit}/{warn_limit} варнов)",
-                                 t, "", msg.chat.id, reply_msg_id=reply_id)
-                tail = f" на {fmt_seconds(default_ban)}" if default_ban > 0 else ""
-                await eph(msg, f"🔨 {t.mention_html()} — забанен{tail} ({warn_limit}/{warn_limit} варнов).",
-                          parse_mode=ParseMode.HTML)
-            elif warn_action == "kick":
-                await ctx.bot.ban_chat_member(msg.chat.id, t.id)
-                await ctx.bot.unban_chat_member(msg.chat.id, t.id)
-                await reset_warns(t.id, msg.chat.id)
-                await log_action(ctx.bot, user,
-                                 f"👢 Авто-кик ({warn_limit}/{warn_limit} варнов)",
-                                 t, "", msg.chat.id, reply_msg_id=reply_id)
-                await eph(msg, f"👢 {t.mention_html()} — кикнут ({warn_limit}/{warn_limit} варнов).",
-                          parse_mode=ParseMode.HTML)
-            else:
-                ok = await _mute_user(ctx.bot, msg.chat.id, t.id, auto_mute_sec)
-                if ok:
-                    await reset_warns(t.id, msg.chat.id)
-                    await log_action(ctx.bot, user,
-                                     f"🔇 Авто-мут {fmt_seconds(auto_mute_sec) if auto_mute_sec > 0 else 'навсегда'} ({warn_limit}/{warn_limit})",
-                                     t, "", msg.chat.id, reply_msg_id=reply_id)
-                    mute_ttl = f" на {fmt_seconds(auto_mute_sec)}" if auto_mute_sec > 0 else " навсегда"
-                    await eph(msg, f"🔇 {t.mention_html()} — авто-мут{mute_ttl} ({warn_limit}/{warn_limit}).",
-                              parse_mode=ParseMode.HTML)
-        except Exception as e:
-            log.debug("auto-warn-action fail: %s", e)
+        result = await _apply_warn_limit_action(ctx.bot, msg.chat.id, t, settings)
+        if result:
+            await eph(msg, f"{t.mention_html()} — {result}.", parse_mode=ParseMode.HTML)
 
 
 @require_reply
@@ -2139,16 +2239,20 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) != 1:
+        return
+
     t = await _target_user(msg)
     if not t:
         return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
-        tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
-        await _deny_higher(msg, t.mention_html(), tr); return
+        return
 
     if not await _has_warns(msg.chat.id, t.id):
         await eph(msg, f"ℹ️ У {t.mention_html()} нет варнов — сбрасывать нечего.",
@@ -2193,8 +2297,13 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) != 1:
+        return
+
     t = await _target_user(msg)
     if not t:
         return
@@ -2274,35 +2383,10 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await log_action(ctx.bot, q.from_user, f"⚠️ Варн{ttl_txt} ({total}/{warn_limit}) [кнопка]",
                          target_user_obj or target_id, "", chat_id)
         result = f"⚠️ {mention} — варн{ttl_txt} ({total}/{warn_limit})"
-        if total >= warn_limit:
-            warn_action = str(_s(settings, "warn_action", "ban")).lower()
-            try:
-                if warn_action == "ban":
-                    await _ban_user(ctx.bot, chat_id, target_id, default_ban)
-                    await add_blacklist(target_id, chat_id, "auto_ban_warns")
-                    await reset_warns(target_id, chat_id)
-                    await log_action(ctx.bot, q.from_user,
-                                     f"🔨 Авто-бан ({warn_limit}/{warn_limit} варнов) [кнопка]",
-                                     target_user_obj or target_id, "", chat_id)
-                    result += " → 🔨 авто-бан"
-                elif warn_action == "kick":
-                    await ctx.bot.ban_chat_member(chat_id, target_id)
-                    await ctx.bot.unban_chat_member(chat_id, target_id)
-                    await reset_warns(target_id, chat_id)
-                    await log_action(ctx.bot, q.from_user,
-                                     f"👢 Авто-кик ({warn_limit}/{warn_limit} варнов) [кнопка]",
-                                     target_user_obj or target_id, "", chat_id)
-                    result += " → 👢 авто-кик"
-                else:
-                    ok = await _mute_user(ctx.bot, chat_id, target_id, auto_mute_sec)
-                    if ok:
-                        await reset_warns(target_id, chat_id)
-                        await log_action(ctx.bot, q.from_user,
-                                         f"🔇 Авто-мут ({warn_limit}/{warn_limit}) [кнопка]",
-                                         target_user_obj or target_id, "", chat_id)
-                        result += f" → 🔇 авто-мут"
-            except Exception as e:
-                result += f" (ошибка: {esc(e)})"
+        if total >= warn_limit and target_user_obj is not None:
+            extra = await _apply_warn_limit_action(ctx.bot, chat_id, target_user_obj, settings)
+            if extra:
+                result += f" → {extra}"
 
     elif action == "mute":
         ok = await _mute_user(ctx.bot, chat_id, target_id, default_mute_sec)
@@ -2427,8 +2511,8 @@ async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_SENIOR_MOD:
-        await _rank_error(update, RANK_SENIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_SENIOR_MOD, my_rank):
+        return
 
     parts = (msg.text or "").split()
     if len(parts) < 2:
@@ -2486,8 +2570,8 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
+        return
 
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -2578,8 +2662,8 @@ async def cmd_delete_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
+        return
     parts = (msg.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await eph(msg, "❌ Использование: <code>удалитькружок Название</code>",
@@ -2600,8 +2684,8 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_JUNIOR_MOD:
-        await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
+        return
 
     thread_id = msg.message_thread_id or 0
     parts = (msg.text or "").split()
@@ -2653,8 +2737,8 @@ async def cmd_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_SENIOR_MOD:
-        await _rank_error(update, RANK_SENIOR_MOD, my_rank); return
+    if await _rank_denied(update, RANK_SENIOR_MOD, my_rank):
+        return
 
     parts = (msg.text or "").split()
     arg = parts[1].lower() if len(parts) > 1 else ""
@@ -2749,6 +2833,10 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
 
+    parts = (msg.text or "").split()
+    if len(parts) != 1:
+        return
+
     t = await _target_user(msg)
     if not t:
         await _no_target(msg); return
@@ -2760,6 +2848,9 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None:
+        return
+    parts = (msg.text or "").split()
+    if len(parts) != 1:
         return
     await eph(msg,
               await _build_profile(ctx, msg.chat.id, user),
@@ -2809,6 +2900,8 @@ SETTING_ALIASES = {
     "trigwarnsec":  "trig_warn_sec",
     "триггербан":   "trig_ban_sec",
     "trigbansec":   "trig_ban_sec",
+    "ссылкидействие": "link_action",
+    "linkaction":   "link_action",
 }
 
 BOOL_SETTINGS = {"antispam", "antiraid", "triggers_on", "links_forbidden"}
@@ -2836,6 +2929,22 @@ WARN_ACTION_DISPLAY = {
     "kick": "кик",
 }
 
+LINK_ACTION_ALIASES = {
+    "none": "none", "нет": "none", "выкл": "none", "off": "none", "ничего": "none",
+    "warn": "warn", "варн": "warn", "пред": "warn",
+    "mute": "mute", "мут": "mute",
+    "kick": "kick", "кик": "kick",
+    "ban":  "ban",  "бан":  "ban",
+}
+
+LINK_ACTION_DISPLAY = {
+    "none": "ничего (только удаление)",
+    "warn": "варн",
+    "mute": "мут",
+    "kick": "кик",
+    "ban":  "бан",
+}
+
 
 def _settings_help() -> str:
     return (
@@ -2854,7 +2963,7 @@ def _settings_help() -> str:
         "• <code>настройки флуд N 10с</code> — N сообщений за время\n\n"
         "<b>Время наказаний:</b>\n"
         "• <code>настройки мутфлуд 30м</code> — мут за флуд\n"
-        "• <code>настройки автомут 1ч</code> — длительность авто-мута\n"
+        "• <code>настройки автомут 1ч</code> — длительность авто-мута (в т.ч. при варнах и ссылках)\n"
         "• <code>настройки триггермут 1ч</code> — мут по триггеру\n"
         "• <code>настройки дефмут 10м</code> — мут без указания времени\n"
         "• <code>настройки дефварн 1ч</code> — дефолтный срок варна\n"
@@ -2862,6 +2971,9 @@ def _settings_help() -> str:
         "• <code>настройки триггерварн 1ч</code> — срок варна от триггера\n"
         "• <code>настройки триггербан 1д</code> — срок бана от триггера\n"
         "(для всех этих настроек <b>0 = вечно/навсегда</b>)\n\n"
+        "<b>Наказание за ссылки:</b>\n"
+        "• <code>настройки ссылкидействие ничего|варн|мут|кик|бан</code>\n"
+        "(сроки берутся как у <code>варндействие</code>: дефварн / автомут / дефбан)\n\n"
         "<b>Антирейд окна:</b>\n"
         "• <code>настройки рейдокно 30с</code>\n"
         "• <code>настройки рейдкулдаун 30м</code>\n\n"
@@ -2880,8 +2992,8 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_SENIOR_ADMIN:
-        await _rank_error(update, RANK_SENIOR_ADMIN, my_rank); return
+    if await _rank_denied(update, RANK_SENIOR_ADMIN, my_rank):
+        return
 
     parts = (msg.text or "").split()
 
@@ -2889,6 +3001,9 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s = await get_settings(msg.chat.id)
         cur_action = WARN_ACTION_DISPLAY.get(
             str(_s(s, "warn_action", "ban")).lower(), "бан"
+        )
+        cur_link = LINK_ACTION_DISPLAY.get(
+            str(_s(s, "link_action", "none")).lower(), "ничего"
         )
 
         def _t(key):
@@ -2903,6 +3018,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"кулдаун <b>{fmt_seconds(int(_s(s, 'antiraid_lookback', 1800)))}</b>)\n"
             f"🔹 Триггеры: <b>{'вкл' if s['triggers_on'] else 'выкл'}</b>\n"
             f"🔹 Ссылки запрещены: <b>{'да' if _s(s, 'links_forbidden', 0) else 'нет'}</b>\n"
+            f"🔹 Наказание за ссылки: <b>{cur_link}</b>\n"
             f"🔹 Флуд: <b>{s['flood_limit']}</b> сообщ. / <b>{fmt_seconds(int(s['flood_window']))}</b>\n"
             f"🔹 Мут за флуд: <b>{_t('flood_mute_sec')}</b>\n"
             f"🔹 Варнов до авто-наказания: <b>{_s(s, 'warn_limit', 3)}</b>\n"
@@ -2950,6 +3066,29 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     key = SETTING_ALIASES[key_raw]
+
+    if key == "link_action":
+        variants = " · ".join(LINK_ACTION_DISPLAY[v] for v in
+                              ("none", "warn", "mute", "kick", "ban"))
+        if len(parts) < 3:
+            await eph(msg,
+                      f"❌ Использование: <code>настройки ссылкидействие ничего|варн|мут|кик|бан</code>\n"
+                      f"Доступно: <b>{variants}</b>",
+                      parse_mode=ParseMode.HTML)
+            return
+        raw = parts[2].lower()
+        val = LINK_ACTION_ALIASES.get(raw)
+        if val is None:
+            await eph(msg, f"❌ Значение должно быть: <b>{variants}</b>",
+                      parse_mode=ParseMode.HTML)
+            return
+        await set_setting(msg.chat.id, "link_action", val)
+        await log_action(ctx.bot, user,
+                         f"⚙️ link_action → {LINK_ACTION_DISPLAY[val]}",
+                         "—", "", msg.chat.id)
+        await eph(msg, f"✅ ссылкидействие → <b>{LINK_ACTION_DISPLAY[val]}</b>",
+                  parse_mode=ParseMode.HTML)
+        return
 
     if key in CHOICE_SETTINGS:
         variants = CHOICE_SETTINGS[key]
@@ -3057,12 +3196,22 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 RU_ALIASES = [
     (r"^активация(?:\s+\S+)?$",            cmd_activate),
-    (r"^бан(?:\s+.+)?$",                   cmd_ban),
+    (r"^бан$",                             cmd_ban),
+    (r"^бан\s+[0-9]+\s*[a-zA-Zа-яА-Я]$",   cmd_ban),
+    (r"^бан\s+[0-9]+\s*[a-zA-Zа-яА-Я]\s+.+$", cmd_ban),
+    (r"^бан\s+0$",                         cmd_ban),
+    (r"^бан\s+(?:вечно|навсегда)$",        cmd_ban),
     (r"^разбан$",                          cmd_unban),
     (r"^кик$",                             cmd_kick),
-    (r"^мут(?:\s+\S+)?$",                  cmd_mute),
+    (r"^мут$",                             cmd_mute),
+    (r"^мут\s+[0-9]+\s*[a-zA-Zа-яА-Я]$",   cmd_mute),
+    (r"^мут\s+0$",                         cmd_mute),
+    (r"^мут\s+(?:вечно|навсегда)$",        cmd_mute),
     (r"^размут$",                          cmd_unmute),
-    (r"^варн(?:\s+\S+)?$",                 cmd_warn),
+    (r"^варн$",                            cmd_warn),
+    (r"^варн\s+[0-9]+\s*[a-zA-Zа-яА-Я]$",  cmd_warn),
+    (r"^варн\s+0$",                        cmd_warn),
+    (r"^варн\s+(?:вечно|навсегда)$",       cmd_warn),
     (r"^анварн$",                          cmd_unwarn),
     (r"^варны$",                           cmd_warns),
     (r"^мод$",                             cmd_mod),
@@ -3076,7 +3225,7 @@ RU_ALIASES = [
     (r"^всеранги$",                        cmd_roles),
     (r"^чистка(?:\s+\d+)?$",               cmd_clean),
     (r"^ссылки(?:\s+\S+)?$",               cmd_links),
-    (r"^выдатьранг(?:\s+\S+)?$",           cmd_setrank),
+    (r"^выдатьранг\s+\S+$",                cmd_setrank),
     (r"^снятьранг$",                       cmd_unrank),
     (r"^создатькружок(?:\s+.+)?$",         cmd_create_circle),
     (r"^вступить(?:\s+.+)?$",              cmd_join),
