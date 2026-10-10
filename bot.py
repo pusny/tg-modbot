@@ -973,6 +973,9 @@ async def activation_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or msg.chat.type == "private":
         return
 
+    if msg.chat.id in (ADMIN_CHAT_ID, REPORT_CHAT_ID):
+        return
+
     text = (msg.text or "").strip().lower()
     if text.startswith("/activate") or text.startswith("активация") or text.startswith("activate"):
         return
@@ -1259,21 +1262,28 @@ async def on_bot_added(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     old_status = cm.old_chat_member.status
     new_status = cm.new_chat_member.status
 
-    became_in = (
-        old_status in ("left", "kicked") and new_status in ("member", "administrator", "restricted")
-    ) or (old_status == "member" and new_status == "administrator")
-
-    if not became_in:
+    if not (old_status in ("left", "kicked")
+            and new_status in ("member", "administrator", "restricted")):
         return
 
     if cm.chat.type == "private":
         return
 
     chat_id = cm.chat.id
+
+    if chat_id in (ADMIN_CHAT_ID, REPORT_CHAT_ID):
+        log.info("Бот добавлен в служебный чат %s — активация не требуется", chat_id)
+        return
+
     chat_title = cm.chat.title or cm.chat.full_name or str(chat_id)
 
     if await is_chat_activated(chat_id):
         log.info("Бот снова добавлен в уже активный чат %s (%s)", chat_id, chat_title)
+        return
+
+    existing = await get_pending_key(chat_id)
+    if existing:
+        log.info("Ключ для чата %s уже сгенерирован, повторную генерацию пропускаю", chat_id)
         return
 
     adder = cm.from_user
@@ -1291,18 +1301,6 @@ async def on_bot_added(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await set_pending_key(chat_id, key)
     _log_activation_key(chat_id, chat_title, key)
 
-    await safe(
-        ctx.bot.send_message,
-        chat_id,
-        f"👑 {adder.mention_html()} — теперь <b>Создатель</b> этого чата "
-        f"(добавил бота).\n\n"
-        f"🔒 <b>Чат не активирован.</b>\n"
-        f"Чтобы включить бота, отправь:\n"
-        f"<code>/activate ВАШ_КЛЮЧ</code>\n\n"
-        f"<i>Ключ активации показан в консоли владельца бота.</i>",
-        parse_mode=ParseMode.HTML,
-    )
-
 
 async def cmd_activate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -1312,39 +1310,34 @@ async def cmd_activate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat_id = msg.chat.id
 
+    if chat_id in (ADMIN_CHAT_ID, REPORT_CHAT_ID):
+        await safe(msg.delete)
+        return
+
     if await is_chat_activated(chat_id):
-        await eph(msg, "✅ Чат уже активирован.")
+        await safe(msg.delete)
         return
 
     parts = (msg.text or "").split()
     if len(parts) < 2:
-        await eph(
-            msg,
-            "🔑 <b>Активация бота</b>\n\n"
-            "Использование: <code>/activate КЛЮЧ</code>\n"
-            "Ключ показан в консоли владельца бота.",
-            parse_mode=ParseMode.HTML,
-        )
+        await safe(msg.delete)
         return
 
     entered = parts[1].strip().upper()
     row = await get_pending_key(chat_id)
     if not row:
-        await eph(
-            msg,
-            "❌ Для этого чата нет активного ключа.\n"
-            "Пере-добавь бота, чтобы получить новый ключ.",
-            parse_mode=ParseMode.HTML,
-        )
+        await safe(msg.delete)
         return
 
     expected = (row["key"] or "").upper()
     if entered != expected:
-        await eph(msg, "❌ Неверный ключ.", parse_mode=ParseMode.HTML)
+        await safe(msg.delete)
         return
 
     await activate_chat(chat_id)
     await clear_pending_key(chat_id)
+    await safe(msg.delete)
+
     log.info("Чат %s (%s) активирован пользователем %s",
              chat_id, msg.chat.title or "?", user.id)
 
