@@ -1022,6 +1022,7 @@ async def _mute_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
                 chat_id, user_id, MUTE_PERMS,
                 until_date=int(time.time()) + secs,
             )
+            _schedule(_unmute_later(bot, chat_id, user_id, secs))
         else:
             await bot.restrict_chat_member(chat_id, user_id, MUTE_PERMS)
             _schedule(_unmute_later(bot, chat_id, user_id, secs))
@@ -1037,6 +1038,16 @@ async def _unmute_later(bot, chat_id: int, user_id: int, secs: int):
     try:
         await bot.restrict_chat_member(chat_id, user_id, UNMUTE_PERMS)
         await set_mute(user_id, chat_id, None)
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            target = member.user
+        except Exception:
+            target = user_id
+        await log_action(
+            bot, None,
+            f"🔊 Авто-размут (истёк срок {fmt_seconds(secs)})",
+            target, "", chat_id,
+        )
     except Exception as e:
         log.debug("auto-unmute fail: %s", e)
 
@@ -1106,6 +1117,24 @@ async def _punishment_sweeper(app: Application):
         try:
             now = int(time.time())
 
+            warn_rows = await db_exec(
+                "SELECT user_id, chat_id, warns FROM users "
+                "WHERE warns>0 AND warn_expires_at IS NOT NULL AND warn_expires_at <= ?",
+                (now,), fetch="all",
+            ) or []
+            for r in warn_rows:
+                uid = r["user_id"]; cid = r["chat_id"]; cnt = r["warns"]
+                try:
+                    member = await app.bot.get_chat_member(cid, uid)
+                    target = member.user
+                except Exception:
+                    target = uid
+                await log_action(
+                    app.bot, None,
+                    f"⚠️ Авто-сброс варнов (истёк срок, было {cnt})",
+                    target, "", cid,
+                )
+
             await db_exec(
                 "UPDATE users SET warns=0, warn_expires_at=NULL "
                 "WHERE warns>0 AND warn_expires_at IS NOT NULL AND warn_expires_at <= ?",
@@ -1117,14 +1146,25 @@ async def _punishment_sweeper(app: Application):
                 (now,), fetch="all",
             ) or []
             for r in rows:
+                cid = r["chat_id"]; uid = r["user_id"]
                 try:
-                    await app.bot.unban_chat_member(r["chat_id"], r["user_id"])
+                    await app.bot.unban_chat_member(cid, uid)
                 except Exception:
                     pass
-                await remove_blacklist(r["user_id"], r["chat_id"])
+                await remove_blacklist(uid, cid)
                 await db_exec(
                     "DELETE FROM temp_bans WHERE chat_id=? AND user_id=?",
-                    (r["chat_id"], r["user_id"]),
+                    (cid, uid),
+                )
+                try:
+                    member = await app.bot.get_chat_member(cid, uid)
+                    target = member.user
+                except Exception:
+                    target = uid
+                await log_action(
+                    app.bot, None,
+                    "🔓 Авто-разбан (истёк срок)",
+                    target, "", cid,
                 )
         except Exception as e:
             log.debug("sweeper: %s", e)
