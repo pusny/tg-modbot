@@ -9,7 +9,7 @@ def _ensure(pkg_spec: str, import_name: str) -> None:
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_spec])
 
 
-_ensure("python-telegram-bot>=21,<22", "telegram")
+_ensure("python-telegram-bot>=22,<24", "telegram")
 _ensure("python-dotenv", "dotenv")
 
 
@@ -117,6 +117,14 @@ RANK_NAMES = {
     RANK_SENIOR_MOD:   "⚔ Старший модератор",
     RANK_JUNIOR_MOD:   "⚔ Младший модератор",
     RANK_USER:         "👤 Участник",
+}
+
+RANK_TAGS = {
+    RANK_OWNER:        "Создатель",
+    RANK_SENIOR_ADMIN: "Ст. Админ",
+    RANK_JUNIOR_ADMIN: "Мл. Админ",
+    RANK_SENIOR_MOD:   "Ст. Модератор",
+    RANK_JUNIOR_MOD:   "Мл. Модератор",
 }
 
 RANK_ALIASES = {
@@ -767,6 +775,22 @@ async def _no_target(msg):
     return
 
 
+async def apply_chat_tag(bot, chat_id: int, user_id: int, rank: int) -> bool:
+    tag = RANK_TAGS.get(rank, "")
+    try:
+        setter = getattr(bot, "set_chat_member_tag", None)
+        if setter is None:
+            log.warning("apply_chat_tag: set_chat_member_tag недоступен в этой версии PTB")
+            return False
+        if len(tag) > 16:
+            tag = tag[:16]
+        await setter(chat_id=chat_id, user_id=user_id, tag=tag)
+        return True
+    except Exception as e:
+        log.debug("apply_chat_tag fail: %s", e)
+        return False
+
+
 async def _mute_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
     secs = max(1, int(secs))
     try:
@@ -1375,11 +1399,14 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await set_rank(target.id, msg.chat.id, rank)
+    tag_ok = await apply_chat_tag(ctx.bot, msg.chat.id, target.id, rank)
     await log_action(ctx.bot, user, f"👑 Выдача ранга: {RANK_NAMES[rank]}", target, "",
                      msg.chat.id, reply_msg_id=msg.reply_to_message.message_id)
+
+    tail = "" if tag_ok else "\n<i>(тег не удалось поставить — проверь, что бот админ и у него есть право «Управление тегами»)</i>"
     await eph(
         msg,
-        f"✅ Выдано: {target.mention_html()} → <b>{RANK_NAMES[rank]}</b>",
+        f"✅ Выдано: {target.mention_html()} → <b>{RANK_NAMES[rank]}</b>{tail}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1403,6 +1430,7 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     target = msg.reply_to_message.from_user
     await set_rank(target.id, msg.chat.id, RANK_USER)
+    await apply_chat_tag(ctx.bot, msg.chat.id, target.id, RANK_USER)
     await log_action(ctx.bot, user, "👑 Снятие ранга", target, "", msg.chat.id,
                      reply_msg_id=msg.reply_to_message.message_id)
     await eph(
