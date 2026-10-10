@@ -69,6 +69,7 @@ START_RETRY_DELAY = 10.0
 TG_SEND_SEMAPHORE = 20
 MAX_PENDING_DELETES = 200
 RANK_CACHE_TTL = 60
+STALE_UPDATE_SEC = 300
 
 
 from telegram import (
@@ -1370,6 +1371,17 @@ _raid_buckets:  dict = defaultdict(deque)
 _raid_alerted:  dict = {}
 
 
+def _is_stale(update: Update) -> bool:
+    msg = update.effective_message
+    if msg is None:
+        return False
+    try:
+        age = time.time() - msg.date.timestamp()
+        return age > STALE_UPDATE_SEC
+    except Exception:
+        return False
+
+
 async def activation_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg is None or msg.chat.type == "private":
@@ -1386,6 +1398,11 @@ async def activation_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     raise ApplicationHandlerStop
+
+
+async def stale_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if _is_stale(update):
+        raise ApplicationHandlerStop
 
 
 async def private_block_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3452,7 +3469,12 @@ async def _build_app() -> Application:
 
     app.add_handler(
         MessageHandler(G, activation_mw),
-        group=-200,
+        group=-300,
+    )
+
+    app.add_handler(
+        MessageHandler(G, stale_mw),
+        group=-250,
     )
 
     app.add_handler(
@@ -3530,7 +3552,9 @@ async def _start_with_retry() -> Application:
             await app.start()
             await app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=False,
+                drop_pending_updates=True,
+                poll_interval=1.0,
+                timeout=30,
             )
             log.info("Bot running. Ctrl+C to stop.")
             return app
