@@ -224,7 +224,9 @@ async def safe(coro_fn, *args, retries: int = 3, **kwargs):
 
 async def _del_later(bot, chat_id: int, message_id: int, delay: float):
     await asyncio.sleep(delay)
-    await safe(bot.delete_message, chat_id, message_id)
+    ok = await safe(bot.delete_message, chat_id, message_id)
+    if ok is not None:
+        await forget_messages(chat_id, [message_id])
 
 
 async def _delayed(bot, chat_id: int, message_id: int):
@@ -241,8 +243,8 @@ async def _remember_sent(sent, fallback_thread: int = 0):
     try:
         tid = getattr(sent, "message_thread_id", None) or fallback_thread or 0
         await remember_message(sent.chat.id, sent.message_id, tid, None)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("_remember_sent fail: %s", e)
 
 
 async def eph(msg, text: str, delay: Optional[float] = None, bot=None, **kwargs):
@@ -2156,8 +2158,12 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.delete_message(msg.chat.id, mid)
             deleted += 1
-        except Exception:
-            pass
+        except Exception as e:
+            text = str(e).lower()
+            if "not found" in text or "message to delete" in text:
+                pass
+            else:
+                log.debug("clean delete fail mid=%s: %s", mid, e)
     await forget_messages(msg.chat.id, ids)
     await log_action(ctx.bot, user, f"🧹 Чистка: {deleted} сообщ.", "—", "", msg.chat.id)
     note_kwargs = {"message_thread_id": thread_id} if thread_id else {}
