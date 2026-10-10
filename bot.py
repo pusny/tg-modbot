@@ -1,3 +1,4 @@
+```python
 import subprocess
 import sys
 
@@ -14,6 +15,7 @@ _ensure("python-dotenv", "dotenv")
 
 
 import asyncio
+import contextvars
 import html
 import logging
 import os
@@ -103,6 +105,9 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log.info("Config loaded | cwd=%s | admin=%s | admin_thread=%s | report_chat=%s | report_thread=%s",
          Path.cwd(), ADMIN_CHAT_ID, ADMIN_THREAD_ID, REPORT_CHAT_ID, REPORT_THREAD_ID)
+
+
+_acted = contextvars.ContextVar("worm_acted", default=False)
 
 
 RANK_OWNER        = 100
@@ -268,12 +273,13 @@ async def _delayed(bot, chat_id: int, message_id: int):
 async def _remember_sent(sent, fallback_thread: int = 0):
     try:
         tid = getattr(sent, "message_thread_id", None) or fallback_thread or 0
-        await remember_message(sent.chat.id, sent.message_id, tid, None)
+        await remember_message(sent.chat.id, sent.message_id, tid, None, 1)
     except Exception as e:
         log.debug("_remember_sent fail: %s", e)
 
 
 async def eph(msg, text: str, delay: Optional[float] = None, bot=None, **kwargs):
+    _acted.set(True)
     sent = await safe(msg.reply_text, text, **kwargs)
     if sent is None:
         return sent
@@ -469,6 +475,7 @@ CREATE TABLE IF NOT EXISTS messages (
     message_id  INTEGER NOT NULL,
     thread_id   INTEGER NOT NULL DEFAULT 0,
     user_id     INTEGER,
+    is_bot      INTEGER NOT NULL DEFAULT 0,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (chat_id, message_id)
 );
@@ -525,6 +532,10 @@ def _sync_init_db() -> None:
         for col, ddl in SETTINGS_MIGRATIONS:
             if col not in cols:
                 conn.execute(f"ALTER TABLE settings ADD COLUMN {col} {ddl}")
+
+        msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+        if "is_bot" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
 
         mig = conn.execute(
             "SELECT value FROM bot_meta WHERE key='activation_migrated'"
@@ -797,18 +808,32 @@ async def close_report(report_id: int, status: str):
     await db_exec("UPDATE reports SET status=? WHERE id=?", (status, report_id))
 
 
-async def remember_message(chat_id: int, message_id: int, thread_id: int, user_id: Optional[int]):
+async def remember_message(chat_id: int, message_id: int, thread_id: int,
+                           user_id: Optional[int], is_bot: int = 0):
     await db_exec(
-        "INSERT OR REPLACE INTO messages (chat_id, message_id, thread_id, user_id) VALUES (?, ?, ?, ?)",
-        (chat_id, message_id, thread_id, user_id),
+        "INSERT OR REPLACE INTO messages "
+        "(chat_id, message_id, thread_id, user_id, is_bot) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (chat_id, message_id, thread_id, user_id, int(bool(is_bot))),
     )
 
 
-async def last_messages(chat_id: int, thread_id: int, limit: int):
-    return await db_exec(
-        "SELECT message_id FROM messages WHERE chat_id=? AND thread_id=? ORDER BY message_id DESC LIMIT ?",
-        (chat_id, thread_id, limit), fetch="all",
-    ) or []
+async def last_messages(chat_id: int, thread_id: int, limit: int,
+                        include_bots: bool = True):
+    if include_bots:
+        query = (
+            "SELECT message_id FROM messages "
+            "WHERE chat_id=? AND thread_id=? "
+            "AND (user_id IS NOT NULL OR is_bot = 1) "
+            "ORDER BY message_id DESC LIMIT ?"
+        )
+    else:
+        query = (
+            "SELECT message_id FROM messages "
+            "WHERE chat_id=? AND thread_id=? AND user_id IS NOT NULL "
+            "ORDER BY message_id DESC LIMIT ?"
+        )
+    return await db_exec(query, (chat_id, thread_id, limit), fetch="all") or []
 
 
 async def forget_messages(chat_id: int, message_ids: list):
@@ -930,10 +955,13 @@ async def _unmute_later(bot, chat_id: int, user_id: int, secs: int):
 def mod_action(fn):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
+        token = _acted.set(False)
         try:
             await fn(update, ctx)
         finally:
-            if msg is not None and msg.chat.type != "private":
+            was_acted = _acted.get()
+            _acted.reset(token)
+            if was_acted and msg is not None and msg.chat.type != "private":
                 await _delayed(ctx.bot, msg.chat.id, msg.message_id)
     return wrapper
 
@@ -1003,13 +1031,15 @@ async def pre_remember(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg is None or msg.chat.type == "private":
         return
-    if msg.from_user:
-        await upsert_user(msg.from_user.id, msg.chat.id,
-                          msg.from_user.username, msg.from_user.first_name)
+    sender = msg.from_user
+    if sender:
+        await upsert_user(sender.id, msg.chat.id,
+                          sender.username, sender.first_name)
     await remember_message(
         msg.chat.id, msg.message_id,
         msg.message_thread_id or 0,
-        msg.from_user.id if msg.from_user else None,
+        sender.id if sender else None,
+        1 if (sender and sender.is_bot) else 0,
     )
 
 
@@ -1940,6 +1970,7 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _no_target(msg); return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
+    _acted.set(True)
     sent = await safe(
         msg.reply_text,
         f"🛡 <b>Модерация</b>\n"
@@ -2331,25 +2362,35 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         n = 30
     n = max(1, min(n, 100))
 
-    rows = await last_messages(msg.chat.id, thread_id, n)
+    rows = await last_messages(msg.chat.id, thread_id, n, include_bots=True)
     ids = [r["message_id"] for r in rows]
+
     deleted = 0
+    failed = 0
     for mid in ids:
         try:
             await ctx.bot.delete_message(msg.chat.id, mid)
             deleted += 1
         except Exception as e:
+            failed += 1
             text = str(e).lower()
             if "not found" in text or "message to delete" in text:
                 pass
             else:
                 log.debug("clean delete fail mid=%s: %s", mid, e)
+        await asyncio.sleep(0.04)
+
     await forget_messages(msg.chat.id, ids)
-    await log_action(ctx.bot, user, f"🧹 Чистка: {deleted} сообщ.", "—", "", msg.chat.id)
+    await log_action(ctx.bot, user,
+                     f"🧹 Чистка: {deleted} сообщ. (пропущено {failed})",
+                     "—", "", msg.chat.id)
+
     note_kwargs = {"message_thread_id": thread_id} if thread_id else {}
     note = await safe(
         ctx.bot.send_message, msg.chat.id,
-        f"🧹 Удалено: {deleted}",
+        f"🧹 Удалено: <b>{deleted}</b>"
+        + (f"\n⚠️ Не удалось: <b>{failed}</b>" if failed else ""),
+        parse_mode=ParseMode.HTML,
         **note_kwargs,
     )
     if note is not None:
@@ -2882,3 +2923,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
