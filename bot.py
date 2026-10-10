@@ -760,18 +760,7 @@ async def _rank_error(update: Update, min_rank: int, rank: int):
 
 
 async def _deny_higher(msg, target_mention: str, target_rank: int = -1):
-    if target_rank == RANK_OWNER:
-        extra = "👑 <b>Создателя</b> наказать нельзя."
-    elif target_rank == RANK_SENIOR_ADMIN:
-        extra = "🛡 <b>Старшего администратора</b> наказать нельзя."
-    else:
-        rn = RANK_NAMES.get(target_rank, "—") if target_rank >= 0 else "—"
-        extra = f"его ранг: <b>{rn}</b> — не ниже твоего."
-    await eph(
-        msg,
-        f"⛔ Нельзя наказать: {target_mention}\n{extra}",
-        parse_mode=ParseMode.HTML,
-    )
+    return
 
 
 async def _no_target(msg):
