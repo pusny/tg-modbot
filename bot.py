@@ -1425,7 +1425,7 @@ HELP_BLOCKS = {
     "mod_junior_admin": (
         "<b>Админ-команды (реплай):</b>\n"
         "• <code>бан [причина]</code>\n"
-        "• <code>разбан</code> — реплай или <code>разбан ID</code>\n"
+        "• <code>разбан</code> — реплай\n"
         "• <code>роли</code> — все с рангами\n\n",
         RANK_JUNIOR_ADMIN,
     ),
@@ -1769,31 +1769,22 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if my_rank < RANK_JUNIOR_ADMIN:
         await _rank_error(update, RANK_JUNIOR_ADMIN, my_rank); return
 
-    parts = (msg.text or "").split()
-
-    uid = None
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        uid = msg.reply_to_message.from_user.id
-    elif len(parts) >= 2 and parts[1].lstrip("-").isdigit():
-        uid = int(parts[1])
-
-    if uid is None:
+    t = await _target_user(msg)
+    if not t:
         return
 
-    if not await _is_banned(ctx.bot, msg.chat.id, uid):
-        await eph(
-            msg,
-            f"ℹ️ <code>{uid}</code> не в бане — снимать нечего.",
-            parse_mode=ParseMode.HTML,
-        )
+    if not await _is_banned(ctx.bot, msg.chat.id, t.id):
+        await eph(msg, f"ℹ️ {t.mention_html()} не в бане — снимать нечего.",
+                  parse_mode=ParseMode.HTML)
         return
 
+    reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
-        await ctx.bot.unban_chat_member(msg.chat.id, uid)
-        await remove_blacklist(uid, msg.chat.id)
-        await log_action(ctx.bot, user, "🔓 Разбан", uid, "", msg.chat.id,
-                         reply_msg_id=msg.reply_to_message.message_id if msg.reply_to_message else None)
-        await eph(msg, f"✅ Готово: разбанен <code>{uid}</code>.",
+        await ctx.bot.unban_chat_member(msg.chat.id, t.id)
+        await remove_blacklist(t.id, msg.chat.id)
+        await log_action(ctx.bot, user, "🔓 Разбан", t, "", msg.chat.id,
+                         reply_msg_id=reply_id)
+        await eph(msg, f"✅ Готово: {t.mention_html()} разбанен.",
                   parse_mode=ParseMode.HTML)
     except Exception as e:
         await eph(msg, f"❌ Ошибка: {esc(e)}")
@@ -2831,7 +2822,7 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 RU_ALIASES = [
     (r"^активация(?:\s+\S+)?$",            cmd_activate),
     (r"^бан(?:\s+.+)?$",                   cmd_ban),
-    (r"^разбан(?:\s+-?\d+)?$",             cmd_unban),
+    (r"^разбан$",                          cmd_unban),
     (r"^кик$",                             cmd_kick),
     (r"^мут(?:\s+\d+[a-zA-Zа-яА-Я]?)?$",   cmd_mute),
     (r"^размут$",                          cmd_unmute),
