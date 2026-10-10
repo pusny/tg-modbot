@@ -70,6 +70,8 @@ TG_SEND_SEMAPHORE = 20
 MAX_PENDING_DELETES = 200
 RANK_CACHE_TTL = 60
 STALE_UPDATE_SEC = 300
+MOD_CMD_FRESH_SEC = 90
+MOD_CMD_DUP_TTL = 900
 
 
 from telegram import (
@@ -239,6 +241,7 @@ _tg_sem: Optional[asyncio.Semaphore] = None
 _pending_deletes_count = 0
 
 _rank_cache: dict = {}
+_seen_mod_cmds: dict = {}
 
 
 def _schedule(coro):
@@ -1069,6 +1072,13 @@ async def _rank_error(update: Update, min_rank: int, rank: int):
 async def _rank_denied(update: Update, min_rank: int, my_rank: int) -> bool:
     if my_rank >= min_rank:
         return False
+    msg = update.effective_message
+    user = update.effective_user
+    log.info("rank_denied: chat=%s msg=%s user=%s rank=%s need=%s",
+             msg.chat.id if msg else "?",
+             msg.message_id if msg else "?",
+             user.id if user else "?",
+             my_rank, min_rank)
     if my_rank >= RANK_JUNIOR_MOD:
         await _rank_error(update, min_rank, my_rank)
     return True
@@ -1321,6 +1331,10 @@ async def _housekeeping():
                 _, ts = _rank_cache[key]
                 if now - ts > RANK_CACHE_TTL * 3:
                     _rank_cache.pop(key, None)
+
+            for k in list(_seen_mod_cmds.keys()):
+                if now - _seen_mod_cmds[k] > MOD_CMD_DUP_TTL:
+                    _seen_mod_cmds.pop(k, None)
 
         except Exception as e:
             log.debug("housekeeping: %s", e)
@@ -2086,6 +2100,39 @@ def require_reply(fn):
     return wrapper
 
 
+def mod_once(fn):
+    """Пропускает мод-команды старше N сек и дубликаты (chat_id, message_id)."""
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        user = update.effective_user
+        if msg is None or msg.chat.type == "private":
+            return
+
+        key = (msg.chat.id, msg.message_id)
+        now = time.monotonic()
+        prev = _seen_mod_cmds.get(key)
+        if prev is not None and now - prev < MOD_CMD_DUP_TTL:
+            log.info("mod_once SKIP dup: chat=%s msg=%s user=%s",
+                     msg.chat.id, msg.message_id,
+                     user.id if user else "?")
+            return
+        _seen_mod_cmds[key] = now
+
+        try:
+            age = time.time() - msg.date.timestamp()
+            if age > MOD_CMD_FRESH_SEC:
+                log.info("mod_once SKIP stale: chat=%s msg=%s age=%.0fs user=%s",
+                         msg.chat.id, msg.message_id, age,
+                         user.id if user else "?")
+                return
+        except Exception:
+            pass
+
+        return await fn(update, ctx)
+    return wrapper
+
+
+@mod_once
 @require_reply
 @mod_action
 async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2141,6 +2188,7 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@mod_once
 @require_reply
 @mod_action
 async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2180,6 +2228,7 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@mod_once
 @require_reply
 @mod_action
 async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2236,6 +2285,7 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@mod_once
 @require_reply
 @mod_action
 async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2275,6 +2325,7 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@mod_once
 @require_reply
 @mod_action
 async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2308,6 +2359,7 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@mod_once
 @require_reply
 @mod_action
 async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2354,6 +2406,7 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, "❌ Не удалось замутить.")
 
 
+@mod_once
 @require_reply
 @mod_action
 async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2393,6 +2446,7 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@mod_once
 @require_reply
 @mod_action
 async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2445,6 +2499,7 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await eph(msg, f"{t.mention_html()} — {result}.", parse_mode=ParseMode.HTML)
 
 
+@mod_once
 @require_reply
 @mod_action
 async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2503,6 +2558,7 @@ async def cmd_warns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               parse_mode=ParseMode.HTML)
 
 
+@mod_once
 @require_reply
 @mod_action
 async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
