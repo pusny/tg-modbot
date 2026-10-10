@@ -2458,13 +2458,23 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
 
+    has_reply = msg.reply_to_message is not None
+    reply_from = None
+    if has_reply and msg.reply_to_message.from_user:
+        reply_from = msg.reply_to_message.from_user.id
+
+    log.warning(
+        "PROFILE DEBUG | chat=%s | from=%s | has_reply=%s | reply_from=%s | text=%r",
+        msg.chat.id, user.id, has_reply, reply_from, (msg.text or "")[:60]
+    )
+
     t = await _target_user(msg)
     if not t:
+        log.warning("PROFILE DEBUG | no target, silent exit")
         await _no_target(msg); return
 
-    await eph(msg,
-              await _build_profile(ctx, msg.chat.id, t),
-              parse_mode=ParseMode.HTML)
+    log.warning("PROFILE DEBUG | showing profile for user_id=%s", t.id)
+    await eph(msg, await _build_profile(ctx, msg.chat.id, t), parse_mode=ParseMode.HTML)
 
 
 @mod_action
