@@ -227,6 +227,7 @@ def _log_activation_key(chat_id: int, chat_title: str, key: str):
 
 
 _pending_tasks: set = set()
+_pending_unmutes: dict = {}
 
 
 def _schedule(coro):
@@ -236,6 +237,28 @@ def _schedule(coro):
         task.add_done_callback(_pending_tasks.discard)
     except Exception as e:
         log.debug("_schedule fail: %s", e)
+
+
+def _cancel_pending_unmute(chat_id: int, user_id: int):
+    key = (chat_id, user_id)
+    task = _pending_unmutes.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def _schedule_unmute(bot, chat_id: int, user_id: int, secs: int):
+    key = (chat_id, user_id)
+    _cancel_pending_unmute(chat_id, user_id)
+    task = asyncio.create_task(_unmute_later(bot, chat_id, user_id, secs))
+    _pending_unmutes[key] = task
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
+
+    def _cleanup(t, k=key):
+        if _pending_unmutes.get(k) is t:
+            _pending_unmutes.pop(k, None)
+
+    task.add_done_callback(_cleanup)
 
 
 async def safe(coro_fn, *args, retries: int = 3, **kwargs):
@@ -397,7 +420,6 @@ def fmt_seconds(sec: int) -> str:
 
 
 def _parse_cmd_time(tok: str) -> Optional[int]:
-    """Строгий парсер: '30с'→30, '1ч'→3600, '0'/'вечно'→0, иначе None."""
     if not tok:
         return None
     t = tok.strip().lower()
@@ -949,7 +971,6 @@ async def _rank_error(update: Update, min_rank: int, rank: int):
 
 
 async def _rank_denied(update: Update, min_rank: int, my_rank: int) -> bool:
-    """True = стоп. Юзеру (без ранга) — полная тишина, модератору — ошибка."""
     if my_rank >= min_rank:
         return False
     if my_rank >= RANK_JUNIOR_MOD:
@@ -1016,16 +1037,17 @@ async def _mute_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
     secs = int(secs)
     try:
         if secs <= 0:
+            _cancel_pending_unmute(chat_id, user_id)
             await bot.restrict_chat_member(chat_id, user_id, MUTE_PERMS)
         elif secs >= MIN_TG_MUTE_SEC:
             await bot.restrict_chat_member(
                 chat_id, user_id, MUTE_PERMS,
                 until_date=int(time.time()) + secs,
             )
-            _schedule(_unmute_later(bot, chat_id, user_id, secs))
+            _schedule_unmute(bot, chat_id, user_id, secs)
         else:
             await bot.restrict_chat_member(chat_id, user_id, MUTE_PERMS)
-            _schedule(_unmute_later(bot, chat_id, user_id, secs))
+            _schedule_unmute(bot, chat_id, user_id, secs)
         await set_mute(user_id, chat_id, None)
         return True
     except Exception as e:
@@ -1034,7 +1056,10 @@ async def _mute_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
 
 
 async def _unmute_later(bot, chat_id: int, user_id: int, secs: int):
-    await asyncio.sleep(secs)
+    try:
+        await asyncio.sleep(secs)
+    except asyncio.CancelledError:
+        return
     try:
         await bot.restrict_chat_member(chat_id, user_id, UNMUTE_PERMS)
         await set_mute(user_id, chat_id, None)
@@ -2211,6 +2236,7 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
+        _cancel_pending_unmute(msg.chat.id, t.id)
         await ctx.bot.restrict_chat_member(msg.chat.id, t.id, UNMUTE_PERMS)
         await set_mute(t.id, msg.chat.id, None)
         await log_action(ctx.bot, user, "🔊 Размут", t, "", msg.chat.id, reply_msg_id=reply_id)
@@ -2482,6 +2508,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             result = f"ℹ️ {mention} — не в муте"
         else:
             try:
+                _cancel_pending_unmute(chat_id, target_id)
                 await ctx.bot.restrict_chat_member(chat_id, target_id, UNMUTE_PERMS)
                 await set_mute(target_id, chat_id, None)
                 await log_action(ctx.bot, q.from_user, "🔊 Размут [кнопка]",
