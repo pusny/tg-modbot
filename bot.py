@@ -775,12 +775,7 @@ async def _deny_higher(msg, target_mention: str, target_rank: int = -1):
 
 
 async def _no_target(msg):
-    await eph(
-        msg,
-        "❌ Вы никого не реплайнули.\n\n"
-        "Ответь <b>реплаем</b> на сообщение нарушителя и повтори команду.",
-        parse_mode=ParseMode.HTML,
-    )
+    return
 
 
 async def _mute_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
@@ -1482,14 +1477,6 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = int(parts[1])
 
     if uid is None:
-        await eph(
-            msg,
-            "❌ Вы никого не указали.\n\n"
-            "Как разбанить:\n"
-            "• <b>реплаем</b> на любое сообщение нарушителя и напиши <code>разбан</code>\n"
-            "• или укажи ID: <code>разбан 123456789</code>",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     try:
@@ -2117,12 +2104,11 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
     if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
-        await eph(msg, "❌ Ответь на сообщение нарушителя и напиши <code>репорт причина</code>",
-                  parse_mode=ParseMode.HTML); return
+        return
 
     target = msg.reply_to_message.from_user
     if target.id == user.id or target.is_bot:
-        await eph(msg, "❌ Нельзя репортить себя или бота."); return
+        return
 
     parts = (msg.text or "").split(maxsplit=1)
     reason = parts[1].strip() if len(parts) > 1 else "—"
@@ -2157,7 +2143,7 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb,
     )
     if sent is None:
-        await eph(msg, "⚠️ Не смог отправить, попробуй позже."); return
+        return
     await eph(msg, "✅ Жалоба отправлена модераторам.",
               disable_notification=True)
 
