@@ -161,7 +161,7 @@ ACTION_ALIASES = {
     "warn": "warn", "варн": "warn", "предупреждение": "warn", "пред": "warn",
     "mute": "mute", "мут": "mute",
     "kick": "kick", "кик": "kick",
-    "ban": "ban", "бан": "ban",
+    "ban": "ban", "бан": "бан" if False else "ban",
 }
 
 ACTION_HINTS = "варн / мут / кик / бан"
@@ -584,17 +584,10 @@ async def create_circle(chat_id: int, name: str, owner_id: int, thread_id: int) 
     )
 
 
-async def get_circle_by_name(chat_id: int, name: str):
+async def get_circle_by_name(chat_id: int, thread_id: int, name: str):
     return await db_exec(
-        "SELECT * FROM circles WHERE chat_id=? AND lower(name)=lower(?)",
-        (chat_id, name), fetch="one",
-    )
-
-
-async def get_circle_by_thread(chat_id: int, thread_id: int):
-    return await db_exec(
-        "SELECT * FROM circles WHERE chat_id=? AND thread_id=?",
-        (chat_id, thread_id), fetch="one",
+        "SELECT * FROM circles WHERE chat_id=? AND thread_id=? AND lower(name)=lower(?)",
+        (chat_id, thread_id, name), fetch="one",
     )
 
 
@@ -773,6 +766,14 @@ async def _deny_higher(msg, target_mention: str, target_rank: int = -1):
 
 async def _no_target(msg):
     return
+
+
+async def _user_in_chat(bot, chat_id: int, user_id: int) -> bool:
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return False
+    return m.status in ("member", "administrator", "creator", "restricted")
 
 
 async def apply_chat_tag(bot, chat_id: int, user_id: int, rank: int) -> bool:
@@ -1353,6 +1354,10 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    target = msg.reply_to_message.from_user
+    if target.is_bot:
+        return
+
     parts = (msg.text or "").split()
     if len(parts) < 2:
         await eph(
@@ -1384,8 +1389,6 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
         return
-
-    target = msg.reply_to_message.from_user
 
     target_rank = await resolve_rank(ctx.bot, msg.chat.id, target.id)
     if target_rank >= my_rank:
@@ -1419,8 +1422,8 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_OWNER:
-        await _rank_error(update, RANK_OWNER, my_rank)
+    if my_rank < RANK_SENIOR_ADMIN:
+        await _rank_error(update, RANK_SENIOR_ADMIN, my_rank)
         return
 
     if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
@@ -1429,6 +1432,20 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     target = msg.reply_to_message.from_user
+    if target.is_bot:
+        return
+
+    target_rank = await resolve_rank(ctx.bot, msg.chat.id, target.id)
+    if target_rank >= my_rank:
+        tr = RANK_NAMES.get(target_rank, "—")
+        await eph(
+            msg,
+            f"⛔ Нельзя снять ранг: {target.mention_html()}\n"
+            f"его ранг: <b>{tr}</b> — не ниже твоего.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     await set_rank(target.id, msg.chat.id, RANK_USER)
     await apply_chat_tag(ctx.bot, msg.chat.id, target.id, RANK_USER)
     await log_action(ctx.bot, user, "👑 Снятие ранга", target, "", msg.chat.id,
@@ -1446,6 +1463,8 @@ async def _target_user(msg):
     t = msg.reply_to_message.from_user
     if msg.from_user and t.id == msg.from_user.id:
         return None
+    if t.is_bot:
+        return None
     return t
 
 
@@ -1460,6 +1479,8 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = await _target_user(msg)
     if not t:
         await _no_target(msg); return
+    if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
+        return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
@@ -1518,6 +1539,8 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = await _target_user(msg)
     if not t:
         await _no_target(msg); return
+    if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
+        return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
@@ -1543,6 +1566,8 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = await _target_user(msg)
     if not t:
         await _no_target(msg); return
+    if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
+        return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
@@ -1579,6 +1604,8 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = await _target_user(msg)
     if not t:
         await _no_target(msg); return
+    if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
+        return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
@@ -1604,6 +1631,8 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = await _target_user(msg)
     if not t:
         await _no_target(msg); return
+    if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
+        return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
@@ -1661,6 +1690,8 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = await _target_user(msg)
     if not t:
         await _no_target(msg); return
+    if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
+        return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
@@ -1696,6 +1727,8 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = await _target_user(msg)
     if not t:
         await _no_target(msg); return
+    if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
+        return
     sent = await safe(
         msg.reply_text,
         f"🛡 <b>Модерация</b>\n"
@@ -1725,6 +1758,15 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe(q.answer,
                    f"⛔ Нужен {RANK_NAMES.get(required)}", show_alert=True)
         return
+
+    if action in ("ban", "kick", "mute", "warn", "unmute", "unwarn", "unban"):
+        try:
+            m = await ctx.bot.get_chat_member(chat_id, target_id)
+            if m.user and m.user.is_bot:
+                await safe(q.answer, "⛔ Ботов нельзя", show_alert=True)
+                return
+        except Exception:
+            pass
 
     if action in ("ban", "kick", "mute", "warn", "unmute", "unwarn"):
         if not await can_act_on(ctx.bot, chat_id, q.from_user.id, target_id):
@@ -1962,9 +2004,10 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = parts[1].strip()[:60]
     thread_id = msg.message_thread_id or 0
 
-    existing = await get_circle_by_thread(msg.chat.id, thread_id)
+    existing = await get_circle_by_name(msg.chat.id, thread_id, name)
     if existing:
-        await eph(msg, f"В этой теме уже есть кружок: <b>{esc(existing['name'])}</b>",
+        where = "в этой теме" if thread_id else "в этом чате"
+        await eph(msg, f"❌ {where} уже есть кружок <b>{esc(name)}</b>.",
                   parse_mode=ParseMode.HTML)
         return
 
@@ -1985,7 +2028,8 @@ async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ Использование: <code>вступить Название</code>",
                   parse_mode=ParseMode.HTML); return
-    c = await get_circle_by_name(msg.chat.id, parts[1].strip())
+    thread_id = msg.message_thread_id or 0
+    c = await get_circle_by_name(msg.chat.id, thread_id, parts[1].strip())
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     await add_circle_member(c["id"], user.id)
@@ -2001,7 +2045,8 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ Использование: <code>выйти Название</code>",
                   parse_mode=ParseMode.HTML); return
-    c = await get_circle_by_name(msg.chat.id, parts[1].strip())
+    thread_id = msg.message_thread_id or 0
+    c = await get_circle_by_name(msg.chat.id, thread_id, parts[1].strip())
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     await remove_circle_member(c["id"], user.id)
@@ -2017,7 +2062,8 @@ async def cmd_circle_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ Использование: <code>инфокружка Название</code>",
                   parse_mode=ParseMode.HTML); return
-    c = await get_circle_by_name(msg.chat.id, parts[1].strip())
+    thread_id = msg.message_thread_id or 0
+    c = await get_circle_by_name(msg.chat.id, thread_id, parts[1].strip())
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     members = await circle_members(c["id"])
@@ -2044,7 +2090,8 @@ async def cmd_delete_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ Использование: <code>удалитькружок Название</code>",
                   parse_mode=ParseMode.HTML); return
-    c = await get_circle_by_name(msg.chat.id, parts[1].strip())
+    thread_id = msg.message_thread_id or 0
+    c = await get_circle_by_name(msg.chat.id, thread_id, parts[1].strip())
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     if c["owner_id"] != user.id and my_rank < RANK_SENIOR_ADMIN:
@@ -2125,6 +2172,9 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     target = msg.reply_to_message.from_user
     if target.id == user.id or target.is_bot:
+        return
+
+    if not await _user_in_chat(ctx.bot, msg.chat.id, target.id):
         return
 
     parts = (msg.text or "").split(maxsplit=1)
