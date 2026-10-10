@@ -2459,13 +2459,22 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     has_reply = msg.reply_to_message is not None
+    reply_msg_id = None
     reply_from = None
-    if has_reply and msg.reply_to_message.from_user:
-        reply_from = msg.reply_to_message.from_user.id
+    reply_text = None
+    reply_is_auto = None
+    if msg.reply_to_message:
+        reply_msg_id = msg.reply_to_message.message_id
+        if msg.reply_to_message.from_user:
+            reply_from = msg.reply_to_message.from_user.id
+        reply_text = (msg.reply_to_message.text or "")[:40]
+        reply_is_auto = bool(getattr(msg.reply_to_message, "is_automatic_forward", False))
 
     log.warning(
-        "PROFILE DEBUG | chat=%s | from=%s | has_reply=%s | reply_from=%s | text=%r",
-        msg.chat.id, user.id, has_reply, reply_from, (msg.text or "")[:60]
+        "PROFILE DEBUG | chat=%s | thread=%s | from=%s | has_reply=%s | reply_msg_id=%s | reply_from=%s | reply_is_auto=%s | reply_text=%r | text=%r",
+        msg.chat.id, msg.message_thread_id, user.id,
+        has_reply, reply_msg_id, reply_from, reply_is_auto, reply_text,
+        (msg.text or "")[:60]
     )
 
     t = await _target_user(msg)
