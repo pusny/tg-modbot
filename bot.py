@@ -505,6 +505,13 @@ CREATE TABLE IF NOT EXISTS bot_meta (
     key    TEXT PRIMARY KEY,
     value  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS temp_bans (
+    chat_id   INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    until_ts  INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
 """
 
 SETTINGS_MIGRATIONS = [
@@ -521,6 +528,10 @@ SETTINGS_MIGRATIONS = [
     ("ephemeral_delay",   "INTEGER NOT NULL DEFAULT 60"),
     ("trig_warn_limit",   "INTEGER NOT NULL DEFAULT 3"),
     ("links_forbidden",   "INTEGER NOT NULL DEFAULT 0"),
+    ("default_warn_sec",  "INTEGER NOT NULL DEFAULT 0"),
+    ("default_ban_sec",   "INTEGER NOT NULL DEFAULT 0"),
+    ("trig_warn_sec",     "INTEGER NOT NULL DEFAULT 0"),
+    ("trig_ban_sec",      "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -535,6 +546,10 @@ def _sync_init_db() -> None:
         msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
         if "is_bot" not in msg_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
+
+        user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "warn_expires_at" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN warn_expires_at INTEGER")
 
         mig = conn.execute(
             "SELECT value FROM bot_meta WHERE key='activation_migrated'"
@@ -659,9 +674,36 @@ async def add_warn(user_id: int, chat_id: int, delta: int = 1) -> int:
     return row["warns"] if row else 0
 
 
+async def add_warn_with_ttl(user_id: int, chat_id: int, ttl_sec: int) -> int:
+    row = await get_user(user_id, chat_id)
+    prev_warns = int(row["warns"] or 0) if row else 0
+    try:
+        prev_exp = row["warn_expires_at"] if row else None
+    except (IndexError, KeyError):
+        prev_exp = None
+
+    total = await add_warn(user_id, chat_id)
+    now = int(time.time())
+
+    if not ttl_sec or ttl_sec <= 0:
+        new_exp = None
+    elif prev_warns == 0:
+        new_exp = now + int(ttl_sec)
+    elif prev_exp is None:
+        new_exp = None
+    else:
+        new_exp = max(int(prev_exp), now + int(ttl_sec))
+
+    await db_exec(
+        "UPDATE users SET warn_expires_at=? WHERE user_id=? AND chat_id=?",
+        (new_exp, user_id, chat_id),
+    )
+    return total
+
+
 async def reset_warns(user_id: int, chat_id: int):
     await db_exec(
-        "UPDATE users SET warns=0 WHERE user_id=? AND chat_id=?",
+        "UPDATE users SET warns=0, warn_expires_at=NULL WHERE user_id=? AND chat_id=?",
         (user_id, chat_id),
     )
 
@@ -948,9 +990,11 @@ async def apply_chat_tag(bot, chat_id: int, user_id: int, rank: int) -> bool:
 
 
 async def _mute_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
-    secs = max(1, int(secs))
+    secs = int(secs)
     try:
-        if secs >= MIN_TG_MUTE_SEC:
+        if secs <= 0:
+            await bot.restrict_chat_member(chat_id, user_id, MUTE_PERMS)
+        elif secs >= MIN_TG_MUTE_SEC:
             await bot.restrict_chat_member(
                 chat_id, user_id, MUTE_PERMS,
                 until_date=int(time.time()) + secs,
@@ -972,6 +1016,58 @@ async def _unmute_later(bot, chat_id: int, user_id: int, secs: int):
         await set_mute(user_id, chat_id, None)
     except Exception as e:
         log.debug("auto-unmute fail: %s", e)
+
+
+async def _ban_user(bot, chat_id: int, user_id: int, secs: int) -> bool:
+    try:
+        if secs and secs > 0:
+            until = int(time.time()) + int(secs)
+            await bot.ban_chat_member(chat_id, user_id, until_date=until)
+            await db_exec(
+                "INSERT OR REPLACE INTO temp_bans (chat_id, user_id, until_ts) "
+                "VALUES (?, ?, ?)",
+                (chat_id, user_id, until),
+            )
+        else:
+            await bot.ban_chat_member(chat_id, user_id)
+            await db_exec(
+                "DELETE FROM temp_bans WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            )
+        return True
+    except Exception as e:
+        log.debug("_ban_user fail: %s", e)
+        return False
+
+
+async def _punishment_sweeper(app: Application):
+    while True:
+        try:
+            now = int(time.time())
+
+            await db_exec(
+                "UPDATE users SET warns=0, warn_expires_at=NULL "
+                "WHERE warns>0 AND warn_expires_at IS NOT NULL AND warn_expires_at <= ?",
+                (now,),
+            )
+
+            rows = await db_exec(
+                "SELECT chat_id, user_id FROM temp_bans WHERE until_ts <= ?",
+                (now,), fetch="all",
+            ) or []
+            for r in rows:
+                try:
+                    await app.bot.unban_chat_member(r["chat_id"], r["user_id"])
+                except Exception:
+                    pass
+                await remove_blacklist(r["user_id"], r["chat_id"])
+                await db_exec(
+                    "DELETE FROM temp_bans WHERE chat_id=? AND user_id=?",
+                    (r["chat_id"], r["user_id"]),
+                )
+        except Exception as e:
+            log.debug("sweeper: %s", e)
+        await asyncio.sleep(60)
 
 
 def mod_action(fn):
@@ -1089,12 +1185,13 @@ async def antispam_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(bucket) >= settings["flood_limit"]:
         mute_sec = int(_s(settings, "flood_mute_sec", 1800))
         await _mute_user(ctx.bot, msg.chat.id, user.id, mute_sec)
+        ttl = f" на {fmt_seconds(mute_sec)}" if mute_sec > 0 else " навсегда"
         await eph(
             msg,
-            f"🔇 {user.mention_html()} — мут за флуд на {fmt_seconds(mute_sec)}.",
+            f"🔇 {user.mention_html()} — мут за флуд{ttl}.",
             parse_mode=ParseMode.HTML,
         )
-        await log_action(ctx.bot, None, f"🔇 Авто-мут за флуд {fmt_seconds(mute_sec)}", user, "",
+        await log_action(ctx.bot, None, f"🔇 Авто-мут за флуд{ttl}", user, "",
                          msg.chat.id, reply_msg_id=msg.message_id)
         bucket.clear()
         raise ApplicationHandlerStop
@@ -1173,6 +1270,8 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
     trig_warn_limit = int(_s(settings, "trig_warn_limit", 3))
     trig_mute_sec = int(_s(settings, "trig_mute_sec", 3600))
     auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
+    trig_warn_sec = int(_s(settings, "trig_warn_sec", 0))
+    trig_ban_sec = int(_s(settings, "trig_ban_sec", 0))
 
     async def notify(text: str):
         kw = {"parse_mode": ParseMode.HTML}
@@ -1184,27 +1283,29 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
             await _delayed(bot, chat_id, note.message_id)
 
     if action == "warn":
-        total = await add_warn(uid, chat_id)
+        total = await add_warn_with_ttl(uid, chat_id, trig_warn_sec)
+        ttl_txt = f" на {fmt_seconds(trig_warn_sec)}" if trig_warn_sec > 0 else ""
         await notify(
-            f"⚠️ {mention} — предупреждение (триггер: <code>{esc(word)}</code>). "
+            f"⚠️ {mention} — предупреждение{ttl_txt} (триггер: <code>{esc(word)}</code>). "
             f"Всего: {total}/{trig_warn_limit}"
         )
         await log_action(bot, None,
-                         f"⚠️ Авто-варн (триггер: {word}) {total}/{trig_warn_limit}",
+                         f"⚠️ Авто-варн{ttl_txt} (триггер: {word}) {total}/{trig_warn_limit}",
                          user, "", chat_id)
         if total >= trig_warn_limit:
             warn_action = str(_s(settings, "warn_action", "ban")).lower()
             try:
                 if warn_action == "ban":
-                    await bot.ban_chat_member(chat_id, uid)
+                    await _ban_user(bot, chat_id, uid, trig_ban_sec)
                     await add_blacklist(uid, chat_id, "auto_ban_warns")
                     await reset_warns(uid, chat_id)
+                    ban_txt = f" на {fmt_seconds(trig_ban_sec)}" if trig_ban_sec > 0 else ""
                     await notify(
-                        f"🔨 {mention} — забанен "
+                        f"🔨 {mention} — забанен{ban_txt} "
                         f"({trig_warn_limit}/{trig_warn_limit} варнов)."
                     )
                     await log_action(bot, None,
-                                     f"🔨 Авто-бан ({trig_warn_limit}/{trig_warn_limit} варнов по триггеру)",
+                                     f"🔨 Авто-бан{ban_txt} ({trig_warn_limit}/{trig_warn_limit} варнов по триггеру)",
                                      user, "", chat_id)
                 elif warn_action == "kick":
                     await bot.ban_chat_member(chat_id, uid)
@@ -1220,24 +1321,26 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
                 else:
                     await _mute_user(bot, chat_id, uid, auto_mute_sec)
                     await reset_warns(uid, chat_id)
+                    mute_ttl = f" на {fmt_seconds(auto_mute_sec)}" if auto_mute_sec > 0 else " навсегда"
                     await notify(
-                        f"🔇 {mention} — авто-мут на {fmt_seconds(auto_mute_sec)} "
+                        f"🔇 {mention} — авто-мут{mute_ttl} "
                         f"({trig_warn_limit}/{trig_warn_limit})."
                     )
                     await log_action(bot, None,
-                                     f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({trig_warn_limit}/{trig_warn_limit} варна)",
+                                     f"🔇 Авто-мут{mute_ttl} ({trig_warn_limit}/{trig_warn_limit} варна)",
                                      user, "", chat_id)
             except Exception as e:
                 log.debug("auto-warn-action fail (trigger): %s", e)
 
     elif action == "mute":
         await _mute_user(bot, chat_id, uid, trig_mute_sec)
+        mute_ttl = f" на {fmt_seconds(trig_mute_sec)}" if trig_mute_sec > 0 else " навсегда"
         await notify(
-            f"🔇 {mention} — мут на {fmt_seconds(trig_mute_sec)} "
+            f"🔇 {mention} — мут{mute_ttl} "
             f"(триггер: <code>{esc(word)}</code>)."
         )
         await log_action(bot, None,
-                         f"🔇 Авто-мут {fmt_seconds(trig_mute_sec)} (триггер: {word})",
+                         f"🔇 Авто-мут{mute_ttl} (триггер: {word})",
                          user, "", chat_id)
 
     elif action == "kick":
@@ -1253,11 +1356,13 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
 
     elif action == "ban":
         try:
-            await bot.ban_chat_member(chat_id, uid)
+            await _ban_user(bot, chat_id, uid, trig_ban_sec)
+            ban_txt = f" на {fmt_seconds(trig_ban_sec)}" if trig_ban_sec > 0 else ""
             await notify(
-                f"🔨 {mention} — забанен (триггер: <code>{esc(word)}</code>)."
+                f"🔨 {mention} — забанен{ban_txt} (триггер: <code>{esc(word)}</code>)."
             )
-            await log_action(bot, None, f"🔨 Авто-бан (триггер: {word})", user, "", chat_id)
+            await log_action(bot, None, f"🔨 Авто-бан{ban_txt} (триггер: {word})",
+                             user, "", chat_id)
         except Exception as e:
             log.debug("ban fail: %s", e)
 
@@ -1466,7 +1571,7 @@ HELP_BLOCKS = {
     ),
     "mod_junior_admin": (
         "<b>Админ-команды (реплай на сообщение):</b>\n"
-        "• <code>бан [причина]</code>\n"
+        "• <code>бан [1д] [причина]</code>\n"
         "• <code>разбан</code>\n\n",
         RANK_JUNIOR_ADMIN,
     ),
@@ -1484,7 +1589,7 @@ HELP_BLOCKS = {
         "• <code>кик</code>\n"
         "• <code>мут 10м</code> (без времени — дефолт из настроек)\n"
         "• <code>размут</code>\n"
-        "• <code>варн</code>\n"
+        "• <code>варн [1ч]</code> (без времени — дефолт из настроек)\n"
         "• <code>анварн</code>\n"
         "• <code>варны</code>\n"
         "• <code>чистка N</code> — удалить N последних сообщений\n"
@@ -1649,8 +1754,6 @@ async def _target_user(msg):
 
 
 def require_reply(fn):
-    """Команда срабатывает только при реплае на чужое сообщение.
-    Без реплая — тихий выход, ни ошибок, ни ранг-чеков."""
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
         if msg is None or msg.chat.type == "private":
@@ -1786,17 +1889,37 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
-    reason = " ".join((msg.text or "").split()[1:]) or "—"
+
+    settings = await get_settings(msg.chat.id)
+    default_ban = int(_s(settings, "default_ban_sec", 0))
+
+    parts = (msg.text or "").split()
+    secs = 0
+    reason = "—"
+    if len(parts) > 1:
+        maybe = parse_setting_time(parts[1])
+        if maybe > 0:
+            secs = maybe
+            reason = " ".join(parts[2:]).strip() or "—"
+        else:
+            reason = " ".join(parts[1:]).strip() or "—"
+    if secs <= 0:
+        secs = default_ban
+
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
-    try:
-        await ctx.bot.ban_chat_member(msg.chat.id, t.id)
-        await add_blacklist(t.id, msg.chat.id, "banned")
-        await log_action(ctx.bot, user, "🔨 Бан", t, reason, msg.chat.id,
-                         reply_msg_id=reply_id)
-        await eph(msg, f"🔨 Готово: {t.mention_html()} забанен.\nПричина: {esc(reason)}",
-                  parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await eph(msg, f"❌ Ошибка: {esc(e)}")
+    ok = await _ban_user(ctx.bot, msg.chat.id, t.id, secs)
+    if not ok:
+        await eph(msg, "❌ Не удалось забанить."); return
+
+    await add_blacklist(t.id, msg.chat.id, "banned")
+    ttl_txt = f" на {fmt_seconds(secs)}" if secs > 0 else " навсегда"
+    await log_action(ctx.bot, user, f"🔨 Бан{ttl_txt}", t, reason, msg.chat.id,
+                     reply_msg_id=reply_id)
+    await eph(
+        msg,
+        f"🔨 Готово: {t.mention_html()} забанен{ttl_txt}.\nПричина: {esc(reason)}",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @require_reply
@@ -1822,6 +1945,10 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await ctx.bot.unban_chat_member(msg.chat.id, t.id)
         await remove_blacklist(t.id, msg.chat.id)
+        await db_exec(
+            "DELETE FROM temp_bans WHERE chat_id=? AND user_id=?",
+            (msg.chat.id, t.id),
+        )
         await log_action(ctx.bot, user, "🔓 Разбан", t, "", msg.chat.id,
                          reply_msg_id=reply_id)
         await eph(msg, f"✅ Готово: {t.mention_html()} разбанен.",
@@ -1883,15 +2010,13 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         settings = await get_settings(msg.chat.id)
         secs = int(_s(settings, "default_mute_sec", 600))
-    if secs <= 0:
-        settings = await get_settings(msg.chat.id)
-        secs = int(_s(settings, "default_mute_sec", 600))
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     ok = await _mute_user(ctx.bot, msg.chat.id, t.id, secs)
     if ok:
-        await log_action(ctx.bot, user, f"🔇 Мут на {fmt_seconds(secs)}", t, "", msg.chat.id,
+        ttl = f" на {fmt_seconds(secs)}" if secs > 0 else " навсегда"
+        await log_action(ctx.bot, user, f"🔇 Мут{ttl}", t, "", msg.chat.id,
                          reply_msg_id=reply_id)
-        await eph(msg, f"🔇 Готово: {t.mention_html()} замучен на {fmt_seconds(secs)}.",
+        await eph(msg, f"🔇 Готово: {t.mention_html()} замучен{ttl}.",
                   parse_mode=ParseMode.HTML)
     else:
         await eph(msg, "❌ Не удалось замутить.")
@@ -1948,26 +2073,41 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
+
     settings = await get_settings(msg.chat.id)
     warn_limit = int(_s(settings, "warn_limit", 3))
     auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
+    default_warn = int(_s(settings, "default_warn_sec", 0))
+    default_ban = int(_s(settings, "default_ban_sec", 0))
+
+    parts = (msg.text or "").split()
+    secs = 0
+    if len(parts) > 1:
+        secs = parse_setting_time(parts[1])
+    if secs <= 0:
+        secs = default_warn
+
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
-    total = await add_warn(t.id, msg.chat.id)
-    await log_action(ctx.bot, user, f"⚠️ Варн ({total}/{warn_limit})", t, "", msg.chat.id,
-                     reply_msg_id=reply_id)
-    await eph(msg, f"⚠️ Готово: {t.mention_html()} — предупреждение ({total}/{warn_limit}).",
+    total = await add_warn_with_ttl(t.id, msg.chat.id, secs)
+    ttl_txt = f" на {fmt_seconds(secs)}" if secs > 0 else ""
+    await log_action(ctx.bot, user, f"⚠️ Варн{ttl_txt} ({total}/{warn_limit})",
+                     t, "", msg.chat.id, reply_msg_id=reply_id)
+    await eph(msg,
+              f"⚠️ Готово: {t.mention_html()} — предупреждение{ttl_txt} ({total}/{warn_limit}).",
               parse_mode=ParseMode.HTML)
+
     if total >= warn_limit:
         warn_action = str(_s(settings, "warn_action", "ban")).lower()
         try:
             if warn_action == "ban":
-                await ctx.bot.ban_chat_member(msg.chat.id, t.id)
+                await _ban_user(ctx.bot, msg.chat.id, t.id, default_ban)
                 await add_blacklist(t.id, msg.chat.id, "auto_ban_warns")
                 await reset_warns(t.id, msg.chat.id)
                 await log_action(ctx.bot, user,
                                  f"🔨 Авто-бан ({warn_limit}/{warn_limit} варнов)",
                                  t, "", msg.chat.id, reply_msg_id=reply_id)
-                await eph(msg, f"🔨 {t.mention_html()} — забанен ({warn_limit}/{warn_limit} варнов).",
+                tail = f" на {fmt_seconds(default_ban)}" if default_ban > 0 else ""
+                await eph(msg, f"🔨 {t.mention_html()} — забанен{tail} ({warn_limit}/{warn_limit} варнов).",
                           parse_mode=ParseMode.HTML)
             elif warn_action == "kick":
                 await ctx.bot.ban_chat_member(msg.chat.id, t.id)
@@ -1983,9 +2123,10 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if ok:
                     await reset_warns(t.id, msg.chat.id)
                     await log_action(ctx.bot, user,
-                                     f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit})",
+                                     f"🔇 Авто-мут {fmt_seconds(auto_mute_sec) if auto_mute_sec > 0 else 'навсегда'} ({warn_limit}/{warn_limit})",
                                      t, "", msg.chat.id, reply_msg_id=reply_id)
-                    await eph(msg, f"🔇 {t.mention_html()} — авто-мут на {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}).",
+                    mute_ttl = f" на {fmt_seconds(auto_mute_sec)}" if auto_mute_sec > 0 else " навсегда"
+                    await eph(msg, f"🔇 {t.mention_html()} — авто-мут{mute_ttl} ({warn_limit}/{warn_limit}).",
                               parse_mode=ParseMode.HTML)
         except Exception as e:
             log.debug("auto-warn-action fail: %s", e)
@@ -2031,7 +2172,17 @@ async def cmd_warns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = await _target_user(msg) or user
     row = await get_user(t.id, msg.chat.id)
     warns = row["warns"] if row else 0
-    await eph(msg, f"⚠️ {t.mention_html()}: {warns}/{warn_limit} предупреждений.",
+    exp = None
+    try:
+        exp = row["warn_expires_at"] if row else None
+    except (IndexError, KeyError):
+        exp = None
+    tail = ""
+    if warns and exp:
+        left = int(exp) - int(time.time())
+        if left > 0:
+            tail = f" (сгорят через {fmt_seconds(left)})"
+    await eph(msg, f"⚠️ {t.mention_html()}: {warns}/{warn_limit} предупреждений{tail}.",
               parse_mode=ParseMode.HTML)
 
 
@@ -2104,6 +2255,8 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     warn_limit = int(_s(settings, "warn_limit", 3))
     auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
     default_mute_sec = int(_s(settings, "default_mute_sec", 600))
+    default_warn = int(_s(settings, "default_warn_sec", 0))
+    default_ban = int(_s(settings, "default_ban_sec", 0))
 
     try:
         member = await ctx.bot.get_chat_member(chat_id, target_id)
@@ -2116,15 +2269,16 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result = ""
 
     if action == "warn":
-        total = await add_warn(target_id, chat_id)
-        await log_action(ctx.bot, q.from_user, f"⚠️ Варн ({total}/{warn_limit}) [кнопка]",
+        total = await add_warn_with_ttl(target_id, chat_id, default_warn)
+        ttl_txt = f" на {fmt_seconds(default_warn)}" if default_warn > 0 else ""
+        await log_action(ctx.bot, q.from_user, f"⚠️ Варн{ttl_txt} ({total}/{warn_limit}) [кнопка]",
                          target_user_obj or target_id, "", chat_id)
-        result = f"⚠️ {mention} — варн ({total}/{warn_limit})"
+        result = f"⚠️ {mention} — варн{ttl_txt} ({total}/{warn_limit})"
         if total >= warn_limit:
             warn_action = str(_s(settings, "warn_action", "ban")).lower()
             try:
                 if warn_action == "ban":
-                    await ctx.bot.ban_chat_member(chat_id, target_id)
+                    await _ban_user(ctx.bot, chat_id, target_id, default_ban)
                     await add_blacklist(target_id, chat_id, "auto_ban_warns")
                     await reset_warns(target_id, chat_id)
                     await log_action(ctx.bot, q.from_user,
@@ -2144,18 +2298,20 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if ok:
                         await reset_warns(target_id, chat_id)
                         await log_action(ctx.bot, q.from_user,
-                                         f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({warn_limit}/{warn_limit}) [кнопка]",
+                                         f"🔇 Авто-мут ({warn_limit}/{warn_limit}) [кнопка]",
                                          target_user_obj or target_id, "", chat_id)
-                        result += f" → 🔇 авто-мут {fmt_seconds(auto_mute_sec)}"
+                        result += f" → 🔇 авто-мут"
             except Exception as e:
                 result += f" (ошибка: {esc(e)})"
 
     elif action == "mute":
         ok = await _mute_user(ctx.bot, chat_id, target_id, default_mute_sec)
         if ok:
-            await log_action(ctx.bot, q.from_user, f"🔇 Мут {fmt_seconds(default_mute_sec)} [кнопка]",
+            await log_action(ctx.bot, q.from_user,
+                             f"🔇 Мут {fmt_seconds(default_mute_sec) if default_mute_sec > 0 else 'навсегда'} [кнопка]",
                              target_user_obj or target_id, "", chat_id)
-            result = f"🔇 {mention} — мут {fmt_seconds(default_mute_sec)}"
+            mute_ttl = f" на {fmt_seconds(default_mute_sec)}" if default_mute_sec > 0 else " навсегда"
+            result = f"🔇 {mention} — мут{mute_ttl}"
         else:
             result = "❌ мут не удался"
 
@@ -2171,11 +2327,12 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif action == "ban":
         try:
-            await ctx.bot.ban_chat_member(chat_id, target_id)
+            await _ban_user(ctx.bot, chat_id, target_id, default_ban)
             await add_blacklist(target_id, chat_id, "banned_via_button")
             await log_action(ctx.bot, q.from_user, "🔨 Бан [кнопка]",
                              target_user_obj or target_id, "", chat_id)
-            result = f"🔨 {mention} — забанен"
+            ban_txt = f" на {fmt_seconds(default_ban)}" if default_ban > 0 else " навсегда"
+            result = f"🔨 {mention} — забанен{ban_txt}"
         except Exception as e:
             result = f"❌ бан: {esc(e)}"
 
@@ -2186,6 +2343,10 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 await ctx.bot.unban_chat_member(chat_id, target_id)
                 await remove_blacklist(target_id, chat_id)
+                await db_exec(
+                    "DELETE FROM temp_bans WHERE chat_id=? AND user_id=?",
+                    (chat_id, target_id),
+                )
                 await log_action(ctx.bot, q.from_user, "🔓 Разбан [кнопка]",
                                  target_user_obj or target_id, "", chat_id)
                 result = f"🔓 {mention} — разбанен"
@@ -2638,12 +2799,24 @@ SETTING_ALIASES = {
     "trigwarnlimit": "trig_warn_limit",
     "links":        "links_forbidden",
     "ссылки":       "links_forbidden",
+    "дефварн":      "default_warn_sec",
+    "defwarn":      "default_warn_sec",
+    "варнвремя":    "default_warn_sec",
+    "дефбан":       "default_ban_sec",
+    "defban":       "default_ban_sec",
+    "банвремя":     "default_ban_sec",
+    "триггерварн":  "trig_warn_sec",
+    "trigwarnsec":  "trig_warn_sec",
+    "триггербан":   "trig_ban_sec",
+    "trigbansec":   "trig_ban_sec",
 }
 
 BOOL_SETTINGS = {"antispam", "antiraid", "triggers_on", "links_forbidden"}
 
 TIME_SETTINGS = {"flood_mute_sec", "auto_mute_sec", "trig_mute_sec", "default_mute_sec",
-                 "antiraid_window", "antiraid_lookback", "ephemeral_delay"}
+                 "antiraid_window", "antiraid_lookback", "ephemeral_delay",
+                 "default_warn_sec", "default_ban_sec",
+                 "trig_warn_sec", "trig_ban_sec"}
 
 INT_SETTINGS = {"warn_limit", "antiraid_joins", "trig_warn_limit"}
 
@@ -2668,7 +2841,7 @@ def _settings_help() -> str:
     return (
         "<b>Управление настройками</b>\n\n"
         "<b>Время пишется так:</b> <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code>\n"
-        "(с=секунды, м=минуты, ч=часы, д=дни).\n\n"
+        "(с=секунды, м=минуты, ч=часы, д=дни). <b>0 = вечно/навсегда</b>.\n\n"
         "<b>Тумблеры (вкл / выкл):</b>\n"
         "• <code>настройки антиспам вкл|выкл</code>\n"
         "• <code>настройки антирейд вкл|выкл</code>\n"
@@ -2679,13 +2852,20 @@ def _settings_help() -> str:
         "• <code>настройки срварн N</code> — отдельный лимит варнов от триггеров\n"
         "• <code>настройки рейдвходы N</code> — сколько входов за окно → алерт\n"
         "• <code>настройки флуд N 10с</code> — N сообщений за время\n\n"
-        "<b>Время:</b>\n"
+        "<b>Время наказаний:</b>\n"
         "• <code>настройки мутфлуд 30м</code> — мут за флуд\n"
         "• <code>настройки автомут 1ч</code> — длительность авто-мута\n"
         "• <code>настройки триггермут 1ч</code> — мут по триггеру\n"
         "• <code>настройки дефмут 10м</code> — мут без указания времени\n"
-        "• <code>настройки рейдокно 30с</code> — окно вступлений для антирейда\n"
-        "• <code>настройки рейдкулдаун 30м</code> — кулдаун алертов\n"
+        "• <code>настройки дефварн 1ч</code> — дефолтный срок варна\n"
+        "• <code>настройки дефбан 1д</code> — дефолтный срок бана\n"
+        "• <code>настройки триггерварн 1ч</code> — срок варна от триггера\n"
+        "• <code>настройки триггербан 1д</code> — срок бана от триггера\n"
+        "(для всех этих настроек <b>0 = вечно/навсегда</b>)\n\n"
+        "<b>Антирейд окна:</b>\n"
+        "• <code>настройки рейдокно 30с</code>\n"
+        "• <code>настройки рейдкулдаун 30м</code>\n\n"
+        "<b>Служебное:</b>\n"
         "• <code>настройки удаление 60с</code> — через сколько бот удаляет свои сообщения (0 = не удалять)\n\n"
         "<b>Действие при N варнах:</b>\n"
         "• <code>настройки варндействие мут</code> — мут\n"
@@ -2710,6 +2890,11 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cur_action = WARN_ACTION_DISPLAY.get(
             str(_s(s, "warn_action", "ban")).lower(), "бан"
         )
+
+        def _t(key):
+            v = int(_s(s, key, 0))
+            return fmt_seconds(v) if v > 0 else "вечно"
+
         cur = (
             f"<b>Текущие настройки</b>\n"
             f"🔹 Антиспам: <b>{'вкл' if s['antispam'] else 'выкл'}</b>\n"
@@ -2719,13 +2904,17 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔹 Триггеры: <b>{'вкл' if s['triggers_on'] else 'выкл'}</b>\n"
             f"🔹 Ссылки запрещены: <b>{'да' if _s(s, 'links_forbidden', 0) else 'нет'}</b>\n"
             f"🔹 Флуд: <b>{s['flood_limit']}</b> сообщ. / <b>{fmt_seconds(int(s['flood_window']))}</b>\n"
-            f"🔹 Мут за флуд: <b>{fmt_seconds(int(_s(s, 'flood_mute_sec', 1800)))}</b>\n"
+            f"🔹 Мут за флуд: <b>{_t('flood_mute_sec')}</b>\n"
             f"🔹 Варнов до авто-наказания: <b>{_s(s, 'warn_limit', 3)}</b>\n"
             f"🔹 Варнов у триггеров: <b>{_s(s, 'trig_warn_limit', 3)}</b>\n"
             f"🔹 Действие при N варнах: <b>{cur_action}</b>\n"
-            f"🔹 Авто-мут: <b>{fmt_seconds(int(_s(s, 'auto_mute_sec', 3600)))}</b>\n"
-            f"🔹 Мут по триггеру: <b>{fmt_seconds(int(_s(s, 'trig_mute_sec', 3600)))}</b>\n"
-            f"🔹 Мут по умолчанию: <b>{fmt_seconds(int(_s(s, 'default_mute_sec', 600)))}</b>\n"
+            f"🔹 Авто-мут: <b>{_t('auto_mute_sec')}</b>\n"
+            f"🔹 Мут по триггеру: <b>{_t('trig_mute_sec')}</b>\n"
+            f"🔹 Мут по умолчанию: <b>{_t('default_mute_sec')}</b>\n"
+            f"🔹 Срок варна по умолчанию: <b>{_t('default_warn_sec')}</b>\n"
+            f"🔹 Срок бана по умолчанию: <b>{_t('default_ban_sec')}</b>\n"
+            f"🔹 Срок варна от триггера: <b>{_t('trig_warn_sec')}</b>\n"
+            f"🔹 Срок бана от триггера: <b>{_t('trig_ban_sec')}</b>\n"
             f"🔹 Удаление своих сообщений: <b>{fmt_seconds(int(_s(s, 'ephemeral_delay', 60)))}</b>\n\n"
             + _settings_help()
         )
@@ -2804,7 +2993,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 3:
         if key in TIME_SETTINGS:
             await eph(msg, f"❌ Использование: <code>настройки {key_raw} 30м</code>\n"
-                          f"Формат: 10с / 30м / 1ч / 2д",
+                          f"Формат: 10с / 30м / 1ч / 2д / 0 (вечно)",
                       parse_mode=ParseMode.HTML)
         else:
             await eph(msg, f"❌ Использование: <code>настройки {key_raw} N</code>",
@@ -2812,16 +3001,19 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if key in TIME_SETTINGS:
-        secs = parse_setting_time(parts[2])
-        if secs <= 0 and parts[2].strip() != "0":
-            await eph(msg, "❌ Не распознал время. Пример: <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code>",
-                      parse_mode=ParseMode.HTML)
-            return
-        if parts[2].strip() == "0":
+        raw = parts[2].strip().lower()
+        if raw in ("0", "вечно", "навсегда", "forever", "inf", "infinity"):
             secs = 0
+        else:
+            secs = parse_setting_time(raw)
+            if secs <= 0:
+                await eph(msg, "❌ Не распознал время. Пример: <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code> · <code>0</code>",
+                          parse_mode=ParseMode.HTML)
+                return
         await set_setting(msg.chat.id, key, secs)
-        await log_action(ctx.bot, user, f"⚙️ {key} → {fmt_seconds(secs) if secs else 'выкл'}", "—", "", msg.chat.id)
-        await eph(msg, f"✅ {key_raw} → <b>{fmt_seconds(secs) if secs else 'выкл'}</b>",
+        pretty = fmt_seconds(secs) if secs > 0 else "вечно"
+        await log_action(ctx.bot, user, f"⚙️ {key} → {pretty}", "—", "", msg.chat.id)
+        await eph(msg, f"✅ {key_raw} → <b>{pretty}</b>",
                   parse_mode=ParseMode.HTML)
         return
 
@@ -2868,9 +3060,9 @@ RU_ALIASES = [
     (r"^бан(?:\s+.+)?$",                   cmd_ban),
     (r"^разбан$",                          cmd_unban),
     (r"^кик$",                             cmd_kick),
-    (r"^мут(?:\s+\d+[a-zA-Zа-яА-Я]?)?$",   cmd_mute),
+    (r"^мут(?:\s+\S+)?$",                  cmd_mute),
     (r"^размут$",                          cmd_unmute),
-    (r"^варн$",                            cmd_warn),
+    (r"^варн(?:\s+\S+)?$",                 cmd_warn),
     (r"^анварн$",                          cmd_unwarn),
     (r"^варны$",                           cmd_warns),
     (r"^мод$",                             cmd_mod),
@@ -3008,6 +3200,7 @@ async def _start_with_retry() -> Application:
 
 async def _run_bot():
     app = await _start_with_retry()
+    _schedule(_punishment_sweeper(app))
     stop_event = asyncio.Event()
     try:
         await stop_event.wait()
