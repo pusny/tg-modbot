@@ -1668,6 +1668,9 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _target_user(msg):
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
         return None
+    thread_id = msg.message_thread_id or 0
+    if thread_id and msg.reply_to_message.message_id == thread_id:
+        return None
     t = msg.reply_to_message.from_user
     if msg.from_user and t.id == msg.from_user.id:
         return None
@@ -2458,31 +2461,10 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None or msg.chat.type == "private":
         return
 
-    has_reply = msg.reply_to_message is not None
-    reply_msg_id = None
-    reply_from = None
-    reply_text = None
-    reply_is_auto = None
-    if msg.reply_to_message:
-        reply_msg_id = msg.reply_to_message.message_id
-        if msg.reply_to_message.from_user:
-            reply_from = msg.reply_to_message.from_user.id
-        reply_text = (msg.reply_to_message.text or "")[:40]
-        reply_is_auto = bool(getattr(msg.reply_to_message, "is_automatic_forward", False))
-
-    log.warning(
-        "PROFILE DEBUG | chat=%s | thread=%s | from=%s | has_reply=%s | reply_msg_id=%s | reply_from=%s | reply_is_auto=%s | reply_text=%r | text=%r",
-        msg.chat.id, msg.message_thread_id, user.id,
-        has_reply, reply_msg_id, reply_from, reply_is_auto, reply_text,
-        (msg.text or "")[:60]
-    )
-
     t = await _target_user(msg)
     if not t:
-        log.warning("PROFILE DEBUG | no target, silent exit")
         await _no_target(msg); return
 
-    log.warning("PROFILE DEBUG | showing profile for user_id=%s", t.id)
     await eph(msg, await _build_profile(ctx, msg.chat.id, t), parse_mode=ParseMode.HTML)
 
 
