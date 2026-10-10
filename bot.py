@@ -66,6 +66,10 @@ WRITE_TIMEOUT     = 30.0
 POOL_TIMEOUT      = 30.0
 START_RETRY_DELAY = 10.0
 
+TG_SEND_SEMAPHORE = 20
+MAX_PENDING_DELETES = 200
+RANK_CACHE_TTL = 60
+
 
 from telegram import (
     BotCommand,
@@ -75,7 +79,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TimedOut
+from telegram.error import NetworkError, TimedOut, RetryAfter
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -229,6 +233,12 @@ def _log_activation_key(chat_id: int, chat_title: str, key: str):
 _pending_tasks: set = set()
 _pending_unmutes: dict = {}
 
+_db_write_lock: Optional[asyncio.Lock] = None
+_tg_sem: Optional[asyncio.Semaphore] = None
+_pending_deletes_count = 0
+
+_rank_cache: dict = {}
+
 
 def _schedule(coro):
     try:
@@ -261,35 +271,81 @@ def _schedule_unmute(bot, chat_id: int, user_id: int, secs: int):
     task.add_done_callback(_cleanup)
 
 
+def _cache_rank(chat_id: int, user_id: int, rank: int):
+    _rank_cache[(chat_id, user_id)] = (rank, time.monotonic())
+
+
+def _drop_rank_cache(chat_id: int, user_id: int):
+    _rank_cache.pop((chat_id, user_id), None)
+
+
+def _drop_rank_cache_chat(chat_id: int):
+    for k in list(_rank_cache.keys()):
+        if k[0] == chat_id:
+            _rank_cache.pop(k, None)
+
+
+async def _send_with_sem(coro_fn, *args, **kwargs):
+    global _tg_sem
+    if _tg_sem is None:
+        _tg_sem = asyncio.Semaphore(TG_SEND_SEMAPHORE)
+    async with _tg_sem:
+        return await coro_fn(*args, **kwargs)
+
+
 async def safe(coro_fn, *args, retries: int = 3, **kwargs):
     for attempt in range(1, retries + 1):
         try:
-            return await coro_fn(*args, **kwargs)
+            return await _send_with_sem(coro_fn, *args, **kwargs)
+        except RetryAfter as e:
+            wait = float(getattr(e, "retry_after", 3))
+            if attempt == retries:
+                log.debug("safe(): RetryAfter финально — %s", e)
+                return None
+            await asyncio.sleep(min(wait + 0.5, 30))
         except (TimedOut, NetworkError) as e:
             if attempt == retries:
-                log.warning("safe(): окончательно упало — %s", e)
+                log.debug("safe(): окончательно упало — %s", e)
                 return None
             await asyncio.sleep(1.5 * attempt)
         except Exception as e:
-            log.debug("safe(): non-network error — %s", e)
+            msg = str(e).lower()
+            if ("not found" in msg
+                    or "message to delete" in msg
+                    or "message to be replied" in msg
+                    or "message can't be deleted" in msg
+                    or "chat not found" in msg
+                    or "too many requests" in msg):
+                log.debug("safe(): %s", e)
+            else:
+                log.debug("safe(): non-network error — %s", e)
             return None
 
 
 async def _del_later(bot, chat_id: int, message_id: int, delay: float):
-    await asyncio.sleep(delay)
-    ok = await safe(bot.delete_message, chat_id, message_id)
-    if ok is not None:
-        await forget_messages(chat_id, [message_id])
+    global _pending_deletes_count
+    try:
+        await asyncio.sleep(delay)
+        ok = await safe(bot.delete_message, chat_id, message_id)
+        if ok is not None:
+            await forget_messages(chat_id, [message_id])
+    finally:
+        _pending_deletes_count = max(0, _pending_deletes_count - 1)
 
 
 async def _delayed(bot, chat_id: int, message_id: int):
+    global _pending_deletes_count
     try:
         s = await get_settings(chat_id)
         delay = int(_s(s, "ephemeral_delay", int(DEFAULT_EPHEMERAL_DELAY)))
     except Exception:
         delay = int(DEFAULT_EPHEMERAL_DELAY)
-    if delay > 0:
-        _schedule(_del_later(bot, chat_id, message_id, float(delay)))
+    if delay <= 0:
+        return
+    if _pending_deletes_count >= MAX_PENDING_DELETES:
+        return
+    _pending_deletes_count += 1
+    _schedule(_del_later(bot, chat_id, message_id, float(delay)))
 
 
 async def _remember_sent(sent, fallback_thread: int = 0):
@@ -336,7 +392,7 @@ async def send_admin(bot, text: str, **kwargs):
         kw.pop("message_thread_id", None)
         sent = await safe(bot.send_message, ADMIN_CHAT_ID, text, **kw)
     if sent is None:
-        log.warning("send_admin: не удалось доставить лог в %s", ADMIN_CHAT_ID)
+        log.debug("send_admin: не удалось доставить лог в %s", ADMIN_CHAT_ID)
     return sent
 
 
@@ -349,7 +405,7 @@ async def send_report(bot, text: str, **kwargs):
         kw.pop("message_thread_id", None)
         sent = await safe(bot.send_message, REPORT_CHAT_ID, text, **kw)
     if sent is None:
-        log.warning("send_report: не удалось доставить репорт в %s", REPORT_CHAT_ID)
+        log.debug("send_report: не удалось доставить репорт в %s", REPORT_CHAT_ID)
     return sent
 
 
@@ -436,6 +492,8 @@ LINK_RE = re.compile(r"(https?://|t\.me/|telegram\.me/|@[A-Za-z0-9_]{5,})", re.I
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=5000;
 
 CREATE TABLE IF NOT EXISTS users (
     user_id     INTEGER,
@@ -572,7 +630,9 @@ SETTINGS_MIGRATIONS = [
 
 
 def _sync_init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(SCHEMA)
         cols = {row[1] for row in conn.execute("PRAGMA table_info(settings)")}
         for col, ddl in SETTINGS_MIGRATIONS:
@@ -608,19 +668,38 @@ def _sync_init_db() -> None:
         conn.commit()
 
 
-def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.execute(query, params)
-        if fetch == "one":
-            return cur.fetchone()
-        if fetch == "all":
-            return cur.fetchall()
-        conn.commit()
-        return cur.lastrowid
+def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None,
+               _retries: int = 4):
+    last_err = None
+    for attempt in range(_retries):
+        try:
+            with sqlite3.connect(DB_PATH, timeout=10.0) as conn:
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(query, params)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+                conn.commit()
+                return cur.lastrowid
+        except sqlite3.OperationalError as e:
+            last_err = e
+            if "locked" in str(e).lower() and attempt < _retries - 1:
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+    if last_err:
+        raise last_err
 
 
 async def db_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
+    global _db_write_lock
+    if _db_write_lock is None:
+        _db_write_lock = asyncio.Lock()
+    if fetch is None:
+        async with _db_write_lock:
+            return await asyncio.to_thread(_sync_exec, query, params, fetch)
     return await asyncio.to_thread(_sync_exec, query, params, fetch)
 
 
@@ -687,6 +766,7 @@ async def set_rank(user_id: int, chat_id: int, rank: int):
         "UPDATE users SET rank=? WHERE user_id=? AND chat_id=?",
         (rank, user_id, chat_id),
     )
+    _drop_rank_cache(chat_id, user_id)
 
 
 async def get_rank(user_id: int, chat_id: int) -> int:
@@ -937,18 +1017,33 @@ async def remove_blacklist(user_id: int, chat_id: int):
 
 
 async def resolve_rank(bot, chat_id: int, user_id: int) -> int:
+    key = (chat_id, user_id)
+    hit = _rank_cache.get(key)
+    if hit is not None:
+        rank, ts = hit
+        if time.monotonic() - ts < RANK_CACHE_TTL:
+            return rank
+
     db_rank = await get_rank(user_id, chat_id)
     if db_rank >= RANK_OWNER:
+        _cache_rank(chat_id, user_id, db_rank)
         return db_rank
+
     try:
         member = await bot.get_chat_member(chat_id, user_id)
     except Exception:
+        _cache_rank(chat_id, user_id, db_rank)
         return db_rank
+
     if member.status == "creator":
-        return max(db_rank, RANK_OWNER)
-    if member.status == "administrator":
-        return max(db_rank, RANK_SENIOR_ADMIN)
-    return db_rank
+        rank = max(db_rank, RANK_OWNER)
+    elif member.status == "administrator":
+        rank = max(db_rank, RANK_SENIOR_ADMIN)
+    else:
+        rank = db_rank
+
+    _cache_rank(chat_id, user_id, rank)
+    return rank
 
 
 async def can_act_on(bot, chat_id: int, actor_id: int, target_id: int) -> bool:
@@ -1194,6 +1289,41 @@ async def _punishment_sweeper(app: Application):
         except Exception as e:
             log.debug("sweeper: %s", e)
         await asyncio.sleep(60)
+
+
+async def _housekeeping():
+    while True:
+        try:
+            now = time.monotonic()
+
+            for key in list(_flood_buckets.keys()):
+                b = _flood_buckets.get(key)
+                if not b:
+                    _flood_buckets.pop(key, None)
+                    continue
+                if now - b[-1] > 300:
+                    _flood_buckets.pop(key, None)
+
+            for key in list(_raid_buckets.keys()):
+                b = _raid_buckets.get(key)
+                if not b:
+                    _raid_buckets.pop(key, None)
+                    continue
+                if now - b[-1] > 3600:
+                    _raid_buckets.pop(key, None)
+
+            for key in list(_raid_alerted.keys()):
+                if now - _raid_alerted[key] > 7200:
+                    _raid_alerted.pop(key, None)
+
+            for key in list(_rank_cache.keys()):
+                _, ts = _rank_cache[key]
+                if now - ts > RANK_CACHE_TTL * 3:
+                    _rank_cache.pop(key, None)
+
+        except Exception as e:
+            log.debug("housekeeping: %s", e)
+        await asyncio.sleep(300)
 
 
 def mod_action(fn):
@@ -3256,7 +3386,7 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
         return
     name = type(err).__name__
     if name in ("TimedOut", "NetworkError", "ConnectTimeout", "ReadTimeout", "RetryAfter"):
-        log.warning("Сеть глюкнула (%s) — продолжаю.", name)
+        log.debug("Сеть глюкнула (%s) — продолжаю.", name)
         return
     log.exception("Unhandled error in handler:", exc_info=err)
 
@@ -3398,7 +3528,10 @@ async def _start_with_retry() -> Application:
             log.info("Подключение к Telegram (попытка %d)…", attempt)
             await app.initialize()
             await app.start()
-            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            await app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
+            )
             log.info("Bot running. Ctrl+C to stop.")
             return app
         except (TimedOut, NetworkError) as e:
@@ -3417,6 +3550,7 @@ async def _start_with_retry() -> Application:
 async def _run_bot():
     app = await _start_with_retry()
     _schedule(_punishment_sweeper(app))
+    _schedule(_housekeeping())
     stop_event = asyncio.Event()
     try:
         await stop_event.wait()
@@ -3434,10 +3568,21 @@ async def _run_bot():
 def main():
     _sync_init_db()
     log.info("Bot starting…")
-    try:
-        asyncio.run(_run_bot())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Bot stopped.")
+    while True:
+        try:
+            asyncio.run(_run_bot())
+            break
+        except KeyboardInterrupt:
+            log.info("Bot stopped by user.")
+            break
+        except SystemExit:
+            break
+        except Exception as e:
+            log.exception("Фатальный краш (не сеть). Рестарт через 15 сек: %s", e)
+            try:
+                time.sleep(15)
+            except KeyboardInterrupt:
+                break
 
 
 if __name__ == "__main__":
