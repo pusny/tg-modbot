@@ -2458,20 +2458,10 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if msg is None or user is None:
         return
 
-    target = None
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        target = msg.reply_to_message.from_user
-    else:
-        parts = (msg.text or "").split()
-        if len(parts) > 1 and parts[1].lstrip("-").isdigit():
-            try:
-                m = await ctx.bot.get_chat_member(msg.chat.id, int(parts[1]))
-                target = m.user
-            except Exception:
-                target = None
-
-    if target is None:
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
         return
+
+    target = msg.reply_to_message.from_user
 
     await eph(msg,
               await _build_profile(ctx, msg.chat.id, target),
@@ -2735,7 +2725,7 @@ RU_ALIASES = [
     (r"^варны$",                           cmd_warns),
     (r"^мод$",                             cmd_mod),
     (r"^репорт(?:\s+.+)?$",                cmd_report),
-    (r"^профиль(?:\s+-?\d+)?$",            cmd_profile),
+    (r"^профиль$",                         cmd_profile),
     (r"^я$",                               cmd_me),
     (r"^помощь$",                          cmd_help),
     (r"^ранги$",                           cmd_ranks),
