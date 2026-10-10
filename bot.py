@@ -2454,16 +2454,16 @@ async def _build_profile(ctx, chat_id: int, target) -> str:
 
 @mod_action
 async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if msg is None:
-        return
-    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+    msg = update.effective_message; user = update.effective_user
+    if msg is None or user is None or msg.chat.type == "private":
         return
 
-    target = msg.reply_to_message.from_user
+    t = await _target_user(msg)
+    if not t:
+        await _no_target(msg); return
 
     await eph(msg,
-              await _build_profile(ctx, msg.chat.id, target),
+              await _build_profile(ctx, msg.chat.id, t),
               parse_mode=ParseMode.HTML)
 
 
@@ -2724,6 +2724,7 @@ RU_ALIASES = [
     (r"^варны$",                           cmd_warns),
     (r"^мод$",                             cmd_mod),
     (r"^репорт(?:\s+.+)?$",                cmd_report),
+    (r"^профиль$",                         cmd_profile),
     (r"^я$",                               cmd_me),
     (r"^помощь$",                          cmd_help),
     (r"^ранги$",                           cmd_ranks),
@@ -2813,11 +2814,7 @@ async def _build_app() -> Application:
 
     app.add_handler(CommandHandler("report", cmd_report, filters=G))
 
-    app.add_handler(MessageHandler(
-        G & filters.TEXT & filters.REPLY & filters.Regex(re.compile(r"^профиль$", re.IGNORECASE)),
-        cmd_profile,
-    ))
-    app.add_handler(CommandHandler("profile", cmd_profile, filters=G & filters.REPLY))
+    app.add_handler(CommandHandler("profile", cmd_profile, filters=G))
     app.add_handler(CommandHandler("me", cmd_me, filters=G))
 
     app.add_handler(CommandHandler("settings", cmd_settings, filters=G))
