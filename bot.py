@@ -1634,6 +1634,34 @@ async def cmd_roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                   disable_web_page_preview=True)
 
 
+async def _target_user(msg):
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        return None
+    thread_id = msg.message_thread_id or 0
+    if thread_id and msg.reply_to_message.message_id == thread_id:
+        return None
+    t = msg.reply_to_message.from_user
+    if msg.from_user and t.id == msg.from_user.id:
+        return None
+    if t.is_bot:
+        return None
+    return t
+
+
+def require_reply(fn):
+    """Команда срабатывает только при реплае на чужое сообщение.
+    Без реплая — тихий выход, ни ошибок, ни ранг-чеков."""
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        if msg is None or msg.chat.type == "private":
+            return
+        if await _target_user(msg) is None:
+            return
+        return await fn(update, ctx)
+    return wrapper
+
+
+@require_reply
 @mod_action
 async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -1646,19 +1674,7 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_SENIOR_ADMIN, my_rank)
         return
 
-    if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
-        await eph(
-            msg,
-            "❌ Нужно ответить на сообщение того, кому выдаёшь ранг.\n\n"
-            "Пример: ответь на сообщение и напиши <code>выдатьранг мл_мод</code>\n\n"
-            "Доступные ранги:\n" + RANK_HINTS,
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
     target = msg.reply_to_message.from_user
-    if target.is_bot:
-        return
 
     parts = (msg.text or "").split()
     if len(parts) < 2:
@@ -1716,6 +1732,7 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@require_reply
 @mod_action
 async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -1728,14 +1745,7 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_SENIOR_ADMIN, my_rank)
         return
 
-    if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
-        await eph(msg, "❌ Ответь на сообщение того, у кого снять ранг.",
-                  parse_mode=ParseMode.HTML)
-        return
-
     target = msg.reply_to_message.from_user
-    if target.is_bot:
-        return
 
     target_rank = await resolve_rank(ctx.bot, msg.chat.id, target.id)
     if target_rank >= my_rank:
@@ -1759,20 +1769,7 @@ async def cmd_unrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def _target_user(msg):
-    if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        return None
-    thread_id = msg.message_thread_id or 0
-    if thread_id and msg.reply_to_message.message_id == thread_id:
-        return None
-    t = msg.reply_to_message.from_user
-    if msg.from_user and t.id == msg.from_user.id:
-        return None
-    if t.is_bot:
-        return None
-    return t
-
-
+@require_reply
 @mod_action
 async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -1783,7 +1780,7 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_ADMIN, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await _no_target(msg); return
+        return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
@@ -1802,6 +1799,7 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@require_reply
 @mod_action
 async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -1832,6 +1830,7 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@require_reply
 @mod_action
 async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -1842,7 +1841,7 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await _no_target(msg); return
+        return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
@@ -1859,6 +1858,7 @@ async def cmd_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@require_reply
 @mod_action
 async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -1869,7 +1869,7 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await _no_target(msg); return
+        return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
@@ -1897,6 +1897,7 @@ async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, "❌ Не удалось замутить.")
 
 
+@require_reply
 @mod_action
 async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -1907,7 +1908,7 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await _no_target(msg); return
+        return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
@@ -1930,6 +1931,7 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, f"❌ Ошибка: {esc(e)}")
 
 
+@require_reply
 @mod_action
 async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -1940,7 +1942,7 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await _no_target(msg); return
+        return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
@@ -1989,6 +1991,7 @@ async def cmd_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.debug("auto-warn-action fail: %s", e)
 
 
+@require_reply
 @mod_action
 async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -1999,7 +2002,7 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await _no_target(msg); return
+        return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
@@ -2032,6 +2035,7 @@ async def cmd_warns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               parse_mode=ParseMode.HTML)
 
 
+@require_reply
 @mod_action
 async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -2042,7 +2046,7 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _rank_error(update, RANK_JUNIOR_MOD, my_rank); return
     t = await _target_user(msg)
     if not t:
-        await _no_target(msg); return
+        return
     if not await _user_in_chat(ctx.bot, msg.chat.id, t.id):
         return
     _acted.set(True)
