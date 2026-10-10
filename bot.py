@@ -204,14 +204,22 @@ def _gen_key() -> str:
 
 
 def _log_activation_key(chat_id: int, chat_title: str, key: str):
-    line = "═" * 60
-    print(line, flush=True)
-    print(f"  🔑 КЛЮЧ АКТИВАЦИИ", flush=True)
-    print(f"  Чат:   {chat_title} ({chat_id})", flush=True)
-    print(f"  Ключ:  {key}", flush=True)
-    print(f"  В чате: /activate {key}", flush=True)
-    print(line, flush=True)
-    log.info("ACTIVATION KEY | chat=%s (%s) | key=%s", chat_id, chat_title, key)
+    bar = "=" * 60
+    log.warning(bar)
+    log.warning("  KEY ACTIVATION")
+    log.warning("  Chat: %s (%s)", chat_title, chat_id)
+    log.warning("  Key:  %s", key)
+    log.warning("  Usage in chat: /activate %s", key)
+    log.warning(bar)
+    try:
+        print(bar, flush=True)
+        print(f"  KEY ACTIVATION", flush=True)
+        print(f"  Chat: {chat_title} ({chat_id})", flush=True)
+        print(f"  Key:  {key}", flush=True)
+        print(f"  Usage in chat: /activate {key}", flush=True)
+        print(bar, flush=True)
+    except Exception:
+        pass
 
 
 _pending_tasks: set = set()
