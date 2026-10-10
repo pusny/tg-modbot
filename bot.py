@@ -2457,19 +2457,22 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None:
         return
+
+    target = None
     if msg.reply_to_message and msg.reply_to_message.from_user:
         target = msg.reply_to_message.from_user
     else:
         parts = (msg.text or "").split()
-        target = None
         if len(parts) > 1 and parts[1].lstrip("-").isdigit():
             try:
                 m = await ctx.bot.get_chat_member(msg.chat.id, int(parts[1]))
                 target = m.user
             except Exception:
                 target = None
-        if target is None:
-            target = user
+
+    if target is None:
+        return
+
     await eph(msg,
               await _build_profile(ctx, msg.chat.id, target),
               parse_mode=ParseMode.HTML)
@@ -2721,35 +2724,35 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 RU_ALIASES = [
-    (r"^активация(?:\s|$)",        cmd_activate),
-    (r"^бан(?:\s|$)",              cmd_ban),
-    (r"^разбан(?:\s|$)",           cmd_unban),
-    (r"^кик(?:\s|$)",              cmd_kick),
-    (r"^мут(?:\s|$)",              cmd_mute),
-    (r"^размут(?:\s|$)",           cmd_unmute),
-    (r"^варн(?:\s|$)",             cmd_warn),
-    (r"^анварн(?:\s|$)",           cmd_unwarn),
-    (r"^варны(?:\s|$)",            cmd_warns),
-    (r"^мод(?:\s|$)",              cmd_mod),
-    (r"^репорт(?:\s|$)",           cmd_report),
-    (r"^профиль(?:\s|$)",          cmd_profile),
-    (r"^я$",                       cmd_me),
-    (r"^помощь(?:\s|$)",           cmd_help),
-    (r"^ранги(?:\s|$)",            cmd_ranks),
-    (r"^роли(?:\s|$)",             cmd_roles),
-    (r"^списокролей(?:\s|$)",      cmd_roles),
-    (r"^всеранги(?:\s|$)",         cmd_roles),
-    (r"^чистка(?:\s|$)",           cmd_clean),
-    (r"^ссылки(?:\s|$)",           cmd_links),
-    (r"^выдатьранг(?:\s|$)",       cmd_setrank),
-    (r"^снятьранг(?:\s|$)",        cmd_unrank),
-    (r"^создатькружок(?:\s|$)",    cmd_create_circle),
-    (r"^вступить(?:\s|$)",         cmd_join),
-    (r"^выйти(?:\s|$)",            cmd_leave),
-    (r"^инфокружка(?:\s|$)",       cmd_circle_info),
-    (r"^удалитькружок(?:\s|$)",    cmd_delete_circle),
-    (r"^триггер(?:\s|$)",          cmd_trigger),
-    (r"^настройки(?:\s|$)",        cmd_settings),
+    (r"^активация(?:\s+\S+)?$",            cmd_activate),
+    (r"^бан(?:\s+.+)?$",                   cmd_ban),
+    (r"^разбан(?:\s+-?\d+)?$",             cmd_unban),
+    (r"^кик$",                             cmd_kick),
+    (r"^мут(?:\s+\d+[a-zA-Zа-яА-Я]?)?$",   cmd_mute),
+    (r"^размут$",                          cmd_unmute),
+    (r"^варн$",                            cmd_warn),
+    (r"^анварн$",                          cmd_unwarn),
+    (r"^варны$",                           cmd_warns),
+    (r"^мод$",                             cmd_mod),
+    (r"^репорт(?:\s+.+)?$",                cmd_report),
+    (r"^профиль(?:\s+-?\d+)?$",            cmd_profile),
+    (r"^я$",                               cmd_me),
+    (r"^помощь$",                          cmd_help),
+    (r"^ранги$",                           cmd_ranks),
+    (r"^роли$",                            cmd_roles),
+    (r"^списокролей$",                     cmd_roles),
+    (r"^всеранги$",                        cmd_roles),
+    (r"^чистка(?:\s+\d+)?$",               cmd_clean),
+    (r"^ссылки(?:\s+\S+)?$",               cmd_links),
+    (r"^выдатьранг(?:\s+\S+)?$",           cmd_setrank),
+    (r"^снятьранг$",                       cmd_unrank),
+    (r"^создатькружок(?:\s+.+)?$",         cmd_create_circle),
+    (r"^вступить(?:\s+.+)?$",              cmd_join),
+    (r"^выйти(?:\s+.+)?$",                 cmd_leave),
+    (r"^инфокружка(?:\s+.+)?$",            cmd_circle_info),
+    (r"^удалитькружок(?:\s+.+)?$",         cmd_delete_circle),
+    (r"^триггер(?:\s+.+)?$",               cmd_trigger),
+    (r"^настройки(?:\s+.+)?$",             cmd_settings),
 ]
 
 
