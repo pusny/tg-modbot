@@ -908,6 +908,29 @@ async def _user_in_chat(bot, chat_id: int, user_id: int) -> bool:
     return m.status in ("member", "administrator", "creator", "restricted")
 
 
+async def _is_banned(bot, chat_id: int, user_id: int) -> bool:
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return False
+    return m.status == "kicked"
+
+
+async def _is_muted(bot, chat_id: int, user_id: int) -> bool:
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return False
+    if m.status != "restricted":
+        return False
+    return not bool(getattr(m, "can_send_messages", True))
+
+
+async def _has_warns(chat_id: int, user_id: int) -> bool:
+    row = await get_user(user_id, chat_id)
+    return bool(row and row["warns"] and row["warns"] > 0)
+
+
 async def apply_chat_tag(bot, chat_id: int, user_id: int, rank: int) -> bool:
     tag = RANK_TAGS.get(rank, "")
     try:
@@ -1757,6 +1780,14 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if uid is None:
         return
 
+    if not await _is_banned(ctx.bot, msg.chat.id, uid):
+        await eph(
+            msg,
+            f"ℹ️ <code>{uid}</code> не в бане — снимать нечего.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     try:
         await ctx.bot.unban_chat_member(msg.chat.id, uid)
         await remove_blacklist(uid, msg.chat.id)
@@ -1849,6 +1880,12 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
+
+    if not await _is_muted(ctx.bot, msg.chat.id, t.id):
+        await eph(msg, f"ℹ️ {t.mention_html()} не в муте — снимать нечего.",
+                  parse_mode=ParseMode.HTML)
+        return
+
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     try:
         await ctx.bot.restrict_chat_member(msg.chat.id, t.id, UNMUTE_PERMS)
@@ -1935,6 +1972,12 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await can_act_on(ctx.bot, msg.chat.id, user.id, t.id):
         tr = await resolve_rank(ctx.bot, msg.chat.id, t.id)
         await _deny_higher(msg, t.mention_html(), tr); return
+
+    if not await _has_warns(msg.chat.id, t.id):
+        await eph(msg, f"ℹ️ У {t.mention_html()} нет варнов — сбрасывать нечего.",
+                  parse_mode=ParseMode.HTML)
+        return
+
     reply_id = msg.reply_to_message.message_id if msg.reply_to_message else None
     await reset_warns(t.id, msg.chat.id)
     await log_action(ctx.bot, user, "♻️ Сброс варнов", t, "", msg.chat.id, reply_msg_id=reply_id)
@@ -2100,30 +2143,39 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             result = f"❌ бан: {esc(e)}"
 
     elif action == "unban":
-        try:
-            await ctx.bot.unban_chat_member(chat_id, target_id)
-            await remove_blacklist(target_id, chat_id)
-            await log_action(ctx.bot, q.from_user, "🔓 Разбан [кнопка]",
-                             target_user_obj or target_id, "", chat_id)
-            result = f"🔓 {mention} — разбанен"
-        except Exception as e:
-            result = f"❌ разбан: {esc(e)}"
+        if not await _is_banned(ctx.bot, chat_id, target_id):
+            result = f"ℹ️ {mention} — не в бане"
+        else:
+            try:
+                await ctx.bot.unban_chat_member(chat_id, target_id)
+                await remove_blacklist(target_id, chat_id)
+                await log_action(ctx.bot, q.from_user, "🔓 Разбан [кнопка]",
+                                 target_user_obj or target_id, "", chat_id)
+                result = f"🔓 {mention} — разбанен"
+            except Exception as e:
+                result = f"❌ разбан: {esc(e)}"
 
     elif action == "unmute":
-        try:
-            await ctx.bot.restrict_chat_member(chat_id, target_id, UNMUTE_PERMS)
-            await set_mute(target_id, chat_id, None)
-            await log_action(ctx.bot, q.from_user, "🔊 Размут [кнопка]",
-                             target_user_obj or target_id, "", chat_id)
-            result = f"🔊 {mention} — размучен"
-        except Exception as e:
-            result = f"❌ размут: {esc(e)}"
+        if not await _is_muted(ctx.bot, chat_id, target_id):
+            result = f"ℹ️ {mention} — не в муте"
+        else:
+            try:
+                await ctx.bot.restrict_chat_member(chat_id, target_id, UNMUTE_PERMS)
+                await set_mute(target_id, chat_id, None)
+                await log_action(ctx.bot, q.from_user, "🔊 Размут [кнопка]",
+                                 target_user_obj or target_id, "", chat_id)
+                result = f"🔊 {mention} — размучен"
+            except Exception as e:
+                result = f"❌ размут: {esc(e)}"
 
     elif action == "unwarn":
-        await reset_warns(target_id, chat_id)
-        await log_action(ctx.bot, q.from_user, "♻️ Анварн [кнопка]",
-                         target_user_obj or target_id, "", chat_id)
-        result = f"♻️ {mention} — варны сброшены"
+        if not await _has_warns(chat_id, target_id):
+            result = f"ℹ️ {mention} — нет варнов"
+        else:
+            await reset_warns(target_id, chat_id)
+            await log_action(ctx.bot, q.from_user, "♻️ Анварн [кнопка]",
+                             target_user_obj or target_id, "", chat_id)
+            result = f"♻️ {mention} — варны сброшены"
 
     elif action == "profile":
         row = await get_user(target_id, chat_id)
@@ -2564,6 +2616,18 @@ CHOICE_SETTINGS = {
     "warn_action": ("mute", "ban", "kick"),
 }
 
+WARN_ACTION_ALIASES = {
+    "mute": "mute", "мут": "mute",
+    "ban":  "ban",  "бан":  "ban",
+    "kick": "kick", "кик":  "kick",
+}
+
+WARN_ACTION_DISPLAY = {
+    "mute": "мут",
+    "ban":  "бан",
+    "kick": "кик",
+}
+
 
 def _settings_help() -> str:
     return (
@@ -2589,9 +2653,9 @@ def _settings_help() -> str:
         "• <code>настройки рейдкулдаун 30м</code> — кулдаун алертов\n"
         "• <code>настройки удаление 60с</code> — через сколько бот удаляет свои сообщения (0 = не удалять)\n\n"
         "<b>Действие при N варнах:</b>\n"
-        "• <code>настройки варндействие mute</code> — мут\n"
-        "• <code>настройки варндействие ban</code> — бан (по умолчанию)\n"
-        "• <code>настройки варндействие kick</code> — кик\n"
+        "• <code>настройки варндействие мут</code> — мут\n"
+        "• <code>настройки варндействие бан</code> — бан (по умолчанию)\n"
+        "• <code>настройки варндействие кик</code> — кик\n"
     )
 
 
@@ -2608,6 +2672,9 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if len(parts) == 1:
         s = await get_settings(msg.chat.id)
+        cur_action = WARN_ACTION_DISPLAY.get(
+            str(_s(s, "warn_action", "ban")).lower(), "бан"
+        )
         cur = (
             f"<b>Текущие настройки</b>\n"
             f"🔹 Антиспам: <b>{'вкл' if s['antispam'] else 'выкл'}</b>\n"
@@ -2620,14 +2687,14 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔹 Мут за флуд: <b>{fmt_seconds(int(_s(s, 'flood_mute_sec', 1800)))}</b>\n"
             f"🔹 Варнов до авто-наказания: <b>{_s(s, 'warn_limit', 3)}</b>\n"
             f"🔹 Варнов у триггеров: <b>{_s(s, 'trig_warn_limit', 3)}</b>\n"
-            f"🔹 Действие при N варнах: <b>{_s(s, 'warn_action', 'ban')}</b>\n"
+            f"🔹 Действие при N варнах: <b>{cur_action}</b>\n"
             f"🔹 Авто-мут: <b>{fmt_seconds(int(_s(s, 'auto_mute_sec', 3600)))}</b>\n"
             f"🔹 Мут по триггеру: <b>{fmt_seconds(int(_s(s, 'trig_mute_sec', 3600)))}</b>\n"
             f"🔹 Мут по умолчанию: <b>{fmt_seconds(int(_s(s, 'default_mute_sec', 600)))}</b>\n"
             f"🔹 Удаление своих сообщений: <b>{fmt_seconds(int(_s(s, 'ephemeral_delay', 60)))}</b>\n\n"
             + _settings_help()
         )
-        await eph(msg, cur, parse_mode=ParseMode.HTML, delay=60.0)
+        await eph(msg, cur, parse_mode=ParseMode.HTML)
         return
 
     key_raw = parts[1].lower()
@@ -2655,23 +2722,31 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg,
                   f"❌ Параметр <code>{esc(key_raw)}</code> не найден.\n\n"
                   + _settings_help(),
-                  parse_mode=ParseMode.HTML, delay=60.0)
+                  parse_mode=ParseMode.HTML)
         return
 
     key = SETTING_ALIASES[key_raw]
 
     if key in CHOICE_SETTINGS:
         variants = CHOICE_SETTINGS[key]
+        pretty = " · ".join(WARN_ACTION_DISPLAY[v] for v in variants)
         if len(parts) < 3:
-            await eph(msg, f"❌ Использование: <code>настройки {key_raw} {'|'.join(variants)}</code>",
-                      parse_mode=ParseMode.HTML); return
-        val = parts[2].lower()
-        if val not in variants:
-            await eph(msg, f"❌ Значение должно быть: <b>{' · '.join(variants)}</b>",
-                      parse_mode=ParseMode.HTML); return
+            await eph(msg,
+                      f"❌ Использование: <code>настройки {key_raw} мут|бан|кик</code>",
+                      parse_mode=ParseMode.HTML)
+            return
+        raw = parts[2].lower()
+        val = WARN_ACTION_ALIASES.get(raw)
+        if val is None or val not in variants:
+            await eph(msg, f"❌ Значение должно быть: <b>{pretty}</b>",
+                      parse_mode=ParseMode.HTML)
+            return
         await set_setting(msg.chat.id, key, val)
-        await log_action(ctx.bot, user, f"⚙️ {key} → {val}", "—", "", msg.chat.id)
-        await eph(msg, f"✅ {key_raw} → <b>{val}</b>", parse_mode=ParseMode.HTML)
+        await log_action(ctx.bot, user,
+                         f"⚙️ {key} → {WARN_ACTION_DISPLAY[val]}",
+                         "—", "", msg.chat.id)
+        await eph(msg, f"✅ {key_raw} → <b>{WARN_ACTION_DISPLAY[val]}</b>",
+                  parse_mode=ParseMode.HTML)
         return
 
     if key in BOOL_SETTINGS:
