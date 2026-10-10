@@ -1302,6 +1302,48 @@ async def antiraid_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
 
 
+async def on_member_left(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cm = update.chat_member
+    if cm is None:
+        return
+
+    me = await ctx.bot.get_me()
+    u = cm.new_chat_member.user
+    if u.id == me.id or u.is_bot:
+        return
+
+    old_status = cm.old_chat_member.status
+    new_status = cm.new_chat_member.status
+
+    if new_status not in ("kicked", "left"):
+        return
+    if old_status in ("left", "kicked"):
+        return
+
+    chat_id = cm.chat.id
+    user_id = u.id
+
+    row = await get_user(user_id, chat_id)
+    if not row or not row["rank"]:
+        return
+
+    old_rank = row["rank"]
+
+    await set_rank(user_id, chat_id, RANK_USER)
+    await apply_chat_tag(ctx.bot, chat_id, user_id, RANK_USER)
+
+    if new_status == "kicked":
+        action = "🔨 Авто-снятие ранга (бан)"
+    else:
+        action = "🚪 Авто-снятие ранга (выход)"
+
+    await log_action(
+        ctx.bot, None,
+        f"{action}: было {RANK_NAMES.get(old_rank, '—')}",
+        u, "", chat_id,
+    )
+
+
 async def on_bot_added(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cm = update.my_chat_member or update.chat_member
     if cm is None:
@@ -2469,11 +2511,9 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if msg is None or user is None or msg.chat.type == "private":
         return
-    if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
-        return
 
-    target = msg.reply_to_message.from_user
-    if target.id == user.id or target.is_bot:
+    target = await _target_user(msg)
+    if not target:
         return
 
     if not await _user_in_chat(ctx.bot, msg.chat.id, target.id):
@@ -2887,6 +2927,7 @@ async def _build_app() -> Application:
     app.add_handler(MessageHandler(G & (filters.TEXT | filters.CAPTION), trigger_mw), group=-1)
 
     app.add_handler(ChatMemberHandler(antiraid_track, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_member_left, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(on_bot_added, chat_member_types=ChatMemberHandler.MY_CHAT_MEMBER))
 
     app.add_handler(CallbackQueryHandler(cb_mod, pattern=r"^mod:"))
