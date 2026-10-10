@@ -161,7 +161,7 @@ ACTION_ALIASES = {
     "warn": "warn", "варн": "warn", "предупреждение": "warn", "пред": "warn",
     "mute": "mute", "мут": "mute",
     "kick": "kick", "кик": "kick",
-    "ban": "ban", "бан": "бан" if False else "ban",
+    "ban": "ban", "бан": "ban",
 }
 
 ACTION_HINTS = "варн / мут / кик / бан"
@@ -237,10 +237,19 @@ async def _delayed(bot, chat_id: int, message_id: int):
         _schedule(_del_later(bot, chat_id, message_id, float(delay)))
 
 
+async def _remember_sent(sent, fallback_thread: int = 0):
+    try:
+        tid = getattr(sent, "message_thread_id", None) or fallback_thread or 0
+        await remember_message(sent.chat.id, sent.message_id, tid, None)
+    except Exception:
+        pass
+
+
 async def eph(msg, text: str, delay: Optional[float] = None, bot=None, **kwargs):
     sent = await safe(msg.reply_text, text, **kwargs)
     if sent is None:
         return sent
+    await _remember_sent(sent, msg.message_thread_id or 0)
     actual_bot = bot
     if actual_bot is None:
         try:
@@ -982,28 +991,37 @@ async def trigger_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             continue
         if word in text:
             action = row["action"]
+            thread_id = msg.message_thread_id or 0
             await safe(msg.delete)
-            await _apply_trigger(ctx.bot, msg.chat.id, user, action, word, settings)
+            await _apply_trigger(ctx.bot, msg.chat.id, user, action, word, settings, thread_id)
             raise ApplicationHandlerStop
 
 
-async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settings):
+async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settings,
+                         thread_id: int = 0):
     uid = user.id
     mention = user.mention_html()
     trig_warn_limit = int(_s(settings, "trig_warn_limit", 3))
     trig_mute_sec = int(_s(settings, "trig_mute_sec", 3600))
     auto_mute_sec = int(_s(settings, "auto_mute_sec", 3600))
 
+    async def notify(text: str):
+        kw = {"parse_mode": ParseMode.HTML}
+        if thread_id:
+            kw["message_thread_id"] = thread_id
+        note = await safe(bot.send_message, chat_id, text, **kw)
+        if note is not None:
+            await _remember_sent(note, thread_id)
+            await _delayed(bot, chat_id, note.message_id)
+
     if action == "warn":
         total = await add_warn(uid, chat_id)
-        note = await safe(
-            bot.send_message, chat_id,
-            f"⚠️ {mention} — предупреждение (триггер: <code>{esc(word)}</code>). Всего: {total}/{trig_warn_limit}",
-            parse_mode=ParseMode.HTML,
+        await notify(
+            f"⚠️ {mention} — предупреждение (триггер: <code>{esc(word)}</code>). "
+            f"Всего: {total}/{trig_warn_limit}"
         )
-        if note is not None:
-            await _delayed(bot, chat_id, note.message_id)
-        await log_action(bot, None, f"⚠️ Авто-варн (триггер: {word}) {total}/{trig_warn_limit}",
+        await log_action(bot, None,
+                         f"⚠️ Авто-варн (триггер: {word}) {total}/{trig_warn_limit}",
                          user, "", chat_id)
         if total >= trig_warn_limit:
             warn_action = str(_s(settings, "warn_action", "ban")).lower()
@@ -1012,11 +1030,10 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
                     await bot.ban_chat_member(chat_id, uid)
                     await add_blacklist(uid, chat_id, "auto_ban_warns")
                     await reset_warns(uid, chat_id)
-                    note2 = await safe(bot.send_message, chat_id,
-                                       f"🔨 {mention} — забанен ({trig_warn_limit}/{trig_warn_limit} варнов).",
-                                       parse_mode=ParseMode.HTML)
-                    if note2 is not None:
-                        await _delayed(bot, chat_id, note2.message_id)
+                    await notify(
+                        f"🔨 {mention} — забанен "
+                        f"({trig_warn_limit}/{trig_warn_limit} варнов)."
+                    )
                     await log_action(bot, None,
                                      f"🔨 Авто-бан ({trig_warn_limit}/{trig_warn_limit} варнов по триггеру)",
                                      user, "", chat_id)
@@ -1024,41 +1041,53 @@ async def _apply_trigger(bot, chat_id: int, user, action: str, word: str, settin
                     await bot.ban_chat_member(chat_id, uid)
                     await bot.unban_chat_member(chat_id, uid)
                     await reset_warns(uid, chat_id)
-                    note2 = await safe(bot.send_message, chat_id,
-                                       f"👢 {mention} — кикнут ({trig_warn_limit}/{trig_warn_limit} варнов).",
-                                       parse_mode=ParseMode.HTML)
-                    if note2 is not None:
-                        await _delayed(bot, chat_id, note2.message_id)
+                    await notify(
+                        f"👢 {mention} — кикнут "
+                        f"({trig_warn_limit}/{trig_warn_limit} варнов)."
+                    )
                     await log_action(bot, None,
                                      f"👢 Авто-кик ({trig_warn_limit}/{trig_warn_limit} варнов по триггеру)",
                                      user, "", chat_id)
                 else:
                     await _mute_user(bot, chat_id, uid, auto_mute_sec)
                     await reset_warns(uid, chat_id)
-                    note2 = await safe(bot.send_message, chat_id,
-                                       f"🔇 {mention} — авто-мут на {fmt_seconds(auto_mute_sec)} ({trig_warn_limit}/{trig_warn_limit}).",
-                                       parse_mode=ParseMode.HTML)
-                    if note2 is not None:
-                        await _delayed(bot, chat_id, note2.message_id)
+                    await notify(
+                        f"🔇 {mention} — авто-мут на {fmt_seconds(auto_mute_sec)} "
+                        f"({trig_warn_limit}/{trig_warn_limit})."
+                    )
                     await log_action(bot, None,
                                      f"🔇 Авто-мут {fmt_seconds(auto_mute_sec)} ({trig_warn_limit}/{trig_warn_limit} варна)",
                                      user, "", chat_id)
             except Exception as e:
                 log.debug("auto-warn-action fail (trigger): %s", e)
+
     elif action == "mute":
         await _mute_user(bot, chat_id, uid, trig_mute_sec)
-        await log_action(bot, None, f"🔇 Авто-мут {fmt_seconds(trig_mute_sec)} (триггер: {word})",
+        await notify(
+            f"🔇 {mention} — мут на {fmt_seconds(trig_mute_sec)} "
+            f"(триггер: <code>{esc(word)}</code>)."
+        )
+        await log_action(bot, None,
+                         f"🔇 Авто-мут {fmt_seconds(trig_mute_sec)} (триггер: {word})",
                          user, "", chat_id)
+
     elif action == "kick":
         try:
             await bot.ban_chat_member(chat_id, uid)
             await bot.unban_chat_member(chat_id, uid)
+            await notify(
+                f"👢 {mention} — кикнут (триггер: <code>{esc(word)}</code>)."
+            )
             await log_action(bot, None, f"👢 Авто-кик (триггер: {word})", user, "", chat_id)
         except Exception as e:
             log.debug("kick fail: %s", e)
+
     elif action == "ban":
         try:
             await bot.ban_chat_member(chat_id, uid)
+            await notify(
+                f"🔨 {mention} — забанен (триггер: <code>{esc(word)}</code>)."
+            )
             await log_action(bot, None, f"🔨 Авто-бан (триггер: {word})", user, "", chat_id)
         except Exception as e:
             log.debug("ban fail: %s", e)
@@ -1737,6 +1766,7 @@ async def cmd_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=mod_kb(msg.chat.id, t.id),
     )
     if sent is not None:
+        await _remember_sent(sent, msg.message_thread_id or 0)
         await _delayed(ctx.bot, msg.chat.id, sent.message_id)
 
 
@@ -1906,6 +1936,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             **send_kwargs,
         )
         if note is not None:
+            await _remember_sent(note, target_thread)
             await _delayed(ctx.bot, target_chat, note.message_id)
         await safe(q.answer, "Профиль отправлен")
         return
@@ -1923,6 +1954,7 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     note = await safe(q.message.reply_text, result, parse_mode=ParseMode.HTML)
     if note is not None:
+        await _remember_sent(note, q.message.message_thread_id or 0)
         await _delayed(ctx.bot, note.chat.id, note.message_id)
     await safe(q.answer, "Готово")
 
@@ -2135,6 +2167,7 @@ async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         **note_kwargs,
     )
     if note is not None:
+        await _remember_sent(note, thread_id)
         await _delayed(ctx.bot, msg.chat.id, note.message_id)
 
 
