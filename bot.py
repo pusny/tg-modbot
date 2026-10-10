@@ -1331,8 +1331,8 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
-    if my_rank < RANK_OWNER:
-        await _rank_error(update, RANK_OWNER, my_rank)
+    if my_rank < RANK_SENIOR_ADMIN:
+        await _rank_error(update, RANK_SENIOR_ADMIN, my_rank)
         return
 
     if msg.reply_to_message is None or msg.reply_to_message.from_user is None:
@@ -1366,8 +1366,30 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    target = msg.reply_to_message.from_user
     rank = RANK_ALIASES[key]
+
+    if rank >= my_rank:
+        await eph(
+            msg,
+            f"⛔ Нельзя выдать ранг <b>{RANK_NAMES.get(rank, '—')}</b> — "
+            f"он не ниже твоего (<b>{RANK_NAMES.get(my_rank, '—')}</b>).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    target = msg.reply_to_message.from_user
+
+    target_rank = await resolve_rank(ctx.bot, msg.chat.id, target.id)
+    if target_rank >= my_rank:
+        tr = RANK_NAMES.get(target_rank, "—")
+        await eph(
+            msg,
+            f"⛔ Нельзя менять ранг: {target.mention_html()}\n"
+            f"его ранг: <b>{tr}</b> — не ниже твоего.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     await set_rank(target.id, msg.chat.id, rank)
     await log_action(ctx.bot, user, f"👑 Выдача ранга: {RANK_NAMES[rank]}", target, "",
                      msg.chat.id, reply_msg_id=msg.reply_to_message.message_id)
