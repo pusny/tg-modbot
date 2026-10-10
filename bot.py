@@ -1248,7 +1248,7 @@ async def antiraid_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_bot_added(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cm = update.chat_member
+    cm = update.my_chat_member or update.chat_member
     if cm is None:
         return
 
@@ -1264,6 +1264,9 @@ async def on_bot_added(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ) or (old_status == "member" and new_status == "administrator")
 
     if not became_in:
+        return
+
+    if cm.chat.type == "private":
         return
 
     chat_id = cm.chat.id
@@ -2792,7 +2795,7 @@ async def _build_app() -> Application:
     app.add_handler(MessageHandler(G & (filters.TEXT | filters.CAPTION), trigger_mw), group=-1)
 
     app.add_handler(ChatMemberHandler(antiraid_track, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(ChatMemberHandler(on_bot_added, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_bot_added, chat_member_types=ChatMemberHandler.MY_CHAT_MEMBER))
 
     app.add_handler(CallbackQueryHandler(cb_mod, pattern=r"^mod:"))
 
