@@ -18,7 +18,9 @@ import html
 import logging
 import os
 import re
+import secrets
 import sqlite3
+import string
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -194,6 +196,22 @@ def _msg_link(chat_id: int, message_id: Optional[int]) -> str:
     if s.startswith("-100"):
         return f"https://t.me/c/{s[4:]}/{message_id}"
     return ""
+
+
+def _gen_key() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(12))
+
+
+def _log_activation_key(chat_id: int, chat_title: str, key: str):
+    line = "═" * 60
+    print(line, flush=True)
+    print(f"  🔑 КЛЮЧ АКТИВАЦИИ", flush=True)
+    print(f"  Чат:   {chat_title} ({chat_id})", flush=True)
+    print(f"  Ключ:  {key}", flush=True)
+    print(f"  В чате: /activate {key}", flush=True)
+    print(line, flush=True)
+    log.info("ACTIVATION KEY | chat=%s (%s) | key=%s", chat_id, chat_title, key)
 
 
 _pending_tasks: set = set()
@@ -457,6 +475,22 @@ CREATE TABLE IF NOT EXISTS blacklist (
     blocked_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS activations (
+    chat_id       INTEGER PRIMARY KEY,
+    activated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS pending_activations (
+    chat_id     INTEGER PRIMARY KEY,
+    key         TEXT NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS bot_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT
+);
 """
 
 SETTINGS_MIGRATIONS = [
@@ -483,6 +517,25 @@ def _sync_init_db() -> None:
         for col, ddl in SETTINGS_MIGRATIONS:
             if col not in cols:
                 conn.execute(f"ALTER TABLE settings ADD COLUMN {col} {ddl}")
+
+        mig = conn.execute(
+            "SELECT value FROM bot_meta WHERE key='activation_migrated'"
+        ).fetchone()
+        if mig is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO activations (chat_id) "
+                "SELECT DISTINCT chat_id FROM users"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO activations (chat_id) "
+                "SELECT chat_id FROM settings"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO bot_meta (key, value) "
+                "VALUES ('activation_migrated', '1')"
+            )
+            log.info("Активации: миграция выполнена (старые чаты помечены активными).")
+
         conn.commit()
 
 
@@ -500,6 +553,42 @@ def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
 
 async def db_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
     return await asyncio.to_thread(_sync_exec, query, params, fetch)
+
+
+async def is_chat_activated(chat_id: int) -> bool:
+    row = await db_exec(
+        "SELECT chat_id FROM activations WHERE chat_id=?",
+        (chat_id,), fetch="one",
+    )
+    return row is not None
+
+
+async def activate_chat(chat_id: int):
+    await db_exec(
+        "INSERT OR IGNORE INTO activations (chat_id) VALUES (?)",
+        (chat_id,),
+    )
+
+
+async def get_pending_key(chat_id: int):
+    return await db_exec(
+        "SELECT key FROM pending_activations WHERE chat_id=?",
+        (chat_id,), fetch="one",
+    )
+
+
+async def set_pending_key(chat_id: int, key: str):
+    await db_exec(
+        "INSERT OR REPLACE INTO pending_activations (chat_id, key) VALUES (?, ?)",
+        (chat_id, key),
+    )
+
+
+async def clear_pending_key(chat_id: int):
+    await db_exec(
+        "DELETE FROM pending_activations WHERE chat_id=?",
+        (chat_id,),
+    )
 
 
 async def upsert_user(user_id: int, chat_id: int, username: Optional[str], first_name: Optional[str]):
@@ -871,6 +960,21 @@ _raid_buckets:  dict = defaultdict(deque)
 _raid_alerted:  dict = {}
 
 
+async def activation_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or msg.chat.type == "private":
+        return
+
+    text = (msg.text or "").strip().lower()
+    if text.startswith("/activate") or text.startswith("активация") or text.startswith("activate"):
+        return
+
+    if await is_chat_activated(msg.chat.id):
+        return
+
+    raise ApplicationHandlerStop
+
+
 async def private_block_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg is None:
@@ -1154,24 +1258,93 @@ async def on_bot_added(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not became_in:
         return
 
+    chat_id = cm.chat.id
+    chat_title = cm.chat.title or cm.chat.full_name or str(chat_id)
+
+    if await is_chat_activated(chat_id):
+        log.info("Бот снова добавлен в уже активный чат %s (%s)", chat_id, chat_title)
+        return
+
     adder = cm.from_user
     if adder is None or adder.is_bot:
-        log.warning("Не смог определить, кто добавил бота в %s", cm.chat.id)
+        log.warning("Не смог определить, кто добавил бота в %s", chat_id)
         return
 
-    current = await get_rank(adder.id, cm.chat.id)
-    if current >= RANK_OWNER:
-        return
+    current = await get_rank(adder.id, chat_id)
+    if current < RANK_OWNER:
+        await set_rank(adder.id, chat_id, RANK_OWNER)
+        log.info("Bot added to %s by %s (%s) → OWNER",
+                 chat_id, adder.id, adder.username or adder.first_name)
 
-    await set_rank(adder.id, cm.chat.id, RANK_OWNER)
-    log.info("Bot added to %s by %s (%s) → OWNER",
-             cm.chat.id, adder.id, adder.username or adder.first_name)
+    key = _gen_key()
+    await set_pending_key(chat_id, key)
+    _log_activation_key(chat_id, chat_title, key)
 
     await safe(
         ctx.bot.send_message,
-        cm.chat.id,
+        chat_id,
         f"👑 {adder.mention_html()} — теперь <b>Создатель</b> этого чата "
-        f"(добавил бота).\n"
+        f"(добавил бота).\n\n"
+        f"🔒 <b>Чат не активирован.</b>\n"
+        f"Чтобы включить бота, отправь:\n"
+        f"<code>/activate ВАШ_КЛЮЧ</code>\n\n"
+        f"<i>Ключ активации показан в консоли владельца бота.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_activate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None or msg.chat.type == "private":
+        return
+
+    chat_id = msg.chat.id
+
+    if await is_chat_activated(chat_id):
+        await eph(msg, "✅ Чат уже активирован.")
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await eph(
+            msg,
+            "🔑 <b>Активация бота</b>\n\n"
+            "Использование: <code>/activate КЛЮЧ</code>\n"
+            "Ключ показан в консоли владельца бота.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    entered = parts[1].strip().upper()
+    row = await get_pending_key(chat_id)
+    if not row:
+        await eph(
+            msg,
+            "❌ Для этого чата нет активного ключа.\n"
+            "Пере-добавь бота, чтобы получить новый ключ.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    expected = (row["key"] or "").upper()
+    if entered != expected:
+        await eph(msg, "❌ Неверный ключ.", parse_mode=ParseMode.HTML)
+        return
+
+    await activate_chat(chat_id)
+    await clear_pending_key(chat_id)
+    log.info("Чат %s (%s) активирован пользователем %s",
+             chat_id, msg.chat.title or "?", user.id)
+
+    await log_action(ctx.bot, None,
+                     "🔓 Чат активирован",
+                     user, "", chat_id)
+
+    await eph(
+        msg,
+        "✅ <b>Чат активирован!</b>\n"
+        "Теперь бот работает в полную силу.\n"
         f"Список команд: <code>помощь</code>",
         parse_mode=ParseMode.HTML,
     )
@@ -2526,6 +2699,7 @@ async def _post_init(app: Application):
             BotCommand("me", "Мой профиль"),
             BotCommand("profile", "Профиль участника"),
             BotCommand("settings", "Настройки авто-действий"),
+            BotCommand("activate", "Активация бота в чате"),
         ])
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
@@ -2543,6 +2717,7 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 RU_ALIASES = [
+    (r"^активация(?:\s|$)",        cmd_activate),
     (r"^бан(?:\s|$)",              cmd_ban),
     (r"^разбан(?:\s|$)",           cmd_unban),
     (r"^кик(?:\s|$)",              cmd_kick),
@@ -2591,9 +2766,16 @@ async def _build_app() -> Application:
     G = filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP
 
     app.add_handler(
+        MessageHandler(G, activation_mw),
+        group=-200,
+    )
+
+    app.add_handler(
         MessageHandler(filters.ChatType.PRIVATE, private_block_mw),
         group=-100,
     )
+
+    app.add_handler(CommandHandler("activate", cmd_activate, filters=G))
 
     app.add_handler(MessageHandler(G, pre_remember), group=-4)
 
