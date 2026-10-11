@@ -57,11 +57,6 @@ ADMIN_THREAD_ID  = _req_int("ADMIN_THREAD_ID", 0) or None
 REPORT_CHAT_ID   = _req_int("REPORT_CHAT_ID")
 REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
 
-
-# ─────────────────────────────────────────────────────────────
-#  DB PATH — приоритет: DATA_DIR > DB_PATH > "bot.db"
-# ─────────────────────────────────────────────────────────────
-
 _data_dir = (os.getenv("DATA_DIR") or "").strip()
 if _data_dir:
     DB_FILE = Path(_data_dir) / "bot.db"
@@ -1016,6 +1011,7 @@ async def circles_of_user(chat_id: int, user_id: int):
         SELECT c.id, c.name FROM circles c
         JOIN circle_members m ON m.circle_id = c.id
         WHERE c.chat_id=? AND m.user_id=?
+        ORDER BY c.id
         """,
         (chat_id, user_id), fetch="all",
     )
@@ -2906,30 +2902,22 @@ async def cb_mod(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             result = f"♻️ {mention} — варны сброшены"
 
     elif action == "profile":
-        row = await get_user(target_id, chat_id)
-        warns = row["warns"] if row else 0
-        rank_val = await resolve_rank(ctx.bot, chat_id, target_id)
-        circles = await circles_of_user(chat_id, target_id)
-        circle_names = ", ".join(c["name"] for c in circles) if circles else "—"
+        header, circle_lines = await _build_profile(ctx, chat_id, target_id, mention)
         target_chat = q.message.chat.id
         target_thread = q.message.message_thread_id or 0
         send_kwargs = {}
         if target_thread:
             send_kwargs["message_thread_id"] = target_thread
-        note = await safe(
-            ctx.bot.send_message, target_chat,
-            f"👤 <b>Профиль</b>\n"
-            f"{mention}\n"
-            f"ID: <code>{target_id}</code>\n"
-            f"Ранг: {RANK_NAMES.get(rank_val, '—')}\n"
-            f"⚠ Варны: {warns}/{warn_limit}\n"
-            f"👥 Кружки: {circle_names}",
-            parse_mode=ParseMode.HTML,
-            **send_kwargs,
-        )
-        if note is not None:
-            await _remember_sent(note, target_thread)
-            await _delayed(ctx.bot, target_chat, note.message_id)
+        for ch in _profile_chunks(header, circle_lines):
+            note = await safe(
+                ctx.bot.send_message, target_chat, ch,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                **send_kwargs,
+            )
+            if note is not None:
+                await _remember_sent(note, target_thread)
+                await _delayed(ctx.bot, target_chat, note.message_id)
         await safe(q.answer, "Профиль отправлен")
         return
 
@@ -3033,7 +3021,6 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     cid = await create_circle(msg.chat.id, name, user.id, 0)
-    await add_circle_member(cid, user.id)
     await eph(msg,
               f"✅ Кружок <b>{esc(name)}</b> создан.\n"
               f"Вступить: <code>вступить {esc(name)}</code>",
@@ -3310,25 +3297,47 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               disable_notification=True)
 
 
-async def _build_profile(ctx, chat_id: int, target) -> str:
-    row = await get_user(target.id, chat_id)
+async def _build_profile(ctx, chat_id: int, target_id: int, mention_html: str):
+    row = await get_user(target_id, chat_id)
     warns = row["warns"] if row else 0
-    rank_val = await resolve_rank(ctx.bot, chat_id, target.id)
-    circles = await circles_of_user(chat_id, target.id)
-    circle_names = ", ".join(c["name"] for c in circles) if circles else "—"
+    rank_val = await resolve_rank(ctx.bot, chat_id, target_id)
+    circles = await circles_of_user(chat_id, target_id)
     settings = await get_settings(chat_id)
     warn_limit = int(_s(settings, "warn_limit", 3))
-    lines = [
-        "👤 <b>Профиль</b>",
-        f"Имя: {target.mention_html()}",
-        f"ID: <code>{target.id}</code>",
-        f"Ранг: <b>{RANK_NAMES.get(rank_val, '—')}</b>",
-        f"⚠ Предупреждений: <b>{warns}/{warn_limit}</b>",
-        f"👥 Кружки: {circle_names}",
-    ]
+
+    header = (
+        "👤 <b>Профиль</b>\n"
+        f"Имя: {mention_html}\n"
+        f"ID: <code>{target_id}</code>\n"
+        f"Ранг: <b>{RANK_NAMES.get(rank_val, '—')}</b>\n"
+        f"⚠ Предупреждений: <b>{warns}/{warn_limit}</b>"
+    )
     if row and row["mute_until"]:
-        lines.append(f"🔇 Мут до: <code>{esc(row['mute_until'])}</code>")
-    return "\n".join(lines)
+        header += f"\n🔇 Мут до: <code>{esc(row['mute_until'])}</code>"
+
+    if circles:
+        header += f"\n\n👥 <b>Кружки</b> — {len(circles)}:"
+        circle_lines = [f"• {esc(c['name'])}" for c in circles]
+    else:
+        header += "\n👥 Кружки: —"
+        circle_lines = []
+
+    return header, circle_lines
+
+
+def _profile_chunks(header: str, lines: list, limit: int = 3500) -> list:
+    if not lines:
+        return [header]
+    chunks = []
+    chunk = header + "\n"
+    for line in lines:
+        if len(chunk) + len(line) + 1 > limit:
+            chunks.append(chunk.rstrip("\n"))
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        chunks.append(chunk.rstrip("\n"))
+    return chunks
 
 
 @mod_action
@@ -3345,7 +3354,11 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not t:
         await _no_target(msg); return
 
-    await eph(msg, await _build_profile(ctx, msg.chat.id, t), parse_mode=ParseMode.HTML)
+    header, circle_lines = await _build_profile(
+        ctx, msg.chat.id, t.id, t.mention_html()
+    )
+    for ch in _profile_chunks(header, circle_lines):
+        await eph(msg, ch, parse_mode=ParseMode.HTML)
 
 
 @mod_action
@@ -3356,9 +3369,11 @@ async def cmd_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = (msg.text or "").split()
     if len(parts) != 1:
         return
-    await eph(msg,
-              await _build_profile(ctx, msg.chat.id, user),
-              parse_mode=ParseMode.HTML)
+    header, circle_lines = await _build_profile(
+        ctx, msg.chat.id, user.id, user.mention_html()
+    )
+    for ch in _profile_chunks(header, circle_lines):
+        await eph(msg, ch, parse_mode=ParseMode.HTML)
 
 
 SETTING_ALIASES = {
