@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import string
 import time
@@ -56,7 +57,100 @@ ADMIN_THREAD_ID  = _req_int("ADMIN_THREAD_ID", 0) or None
 REPORT_CHAT_ID   = _req_int("REPORT_CHAT_ID")
 REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
 
-DB_PATH = os.getenv("DB_PATH") or "bot.db"
+
+# ─────────────────────────────────────────────────────────────
+#  DB PATH — приоритет: DATA_DIR > DB_PATH > "bot.db"
+#  bothost монтирует персистентный том в /app/data (DATA_DIR)
+# ─────────────────────────────────────────────────────────────
+
+_data_dir = (os.getenv("DATA_DIR") or "").strip()
+if _data_dir:
+    DB_FILE = Path(_data_dir) / "bot.db"
+else:
+    DB_PATH_ENV = (os.getenv("DB_PATH") or "bot.db").strip()
+    DB_FILE = Path(DB_PATH_ENV)
+
+DB_PATH = str(DB_FILE)
+DB_DIR = DB_FILE.parent if str(DB_FILE.parent) not in ("", ".") else Path(".")
+
+try:
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+except Exception as _e:
+    raise RuntimeError(f"Не могу создать директорию БД {DB_DIR}: {_e}")
+
+
+def _persist_marker() -> Path:
+    return DB_DIR / ".persist_marker"
+
+
+def _check_persistence() -> bool:
+    m = _persist_marker()
+    now = str(int(time.time()))
+    try:
+        prev = m.read_text().strip() if m.exists() else None
+        m.write_text(now)
+        return prev is not None
+    except Exception:
+        return False
+
+
+def _apply_pragmas(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+
+
+def _wal_checkpoint() -> None:
+    if not DB_FILE.exists():
+        return
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10.0) as c:
+            c.execute("PRAGMA busy_timeout=5000;")
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    except Exception:
+        pass
+
+
+def _backup_rotate(keep: int = 5) -> None:
+    if not DB_FILE.exists():
+        return
+    try:
+        _wal_checkpoint()
+    except Exception:
+        pass
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    for suffix in ("", "-wal", "-shm"):
+        src = Path(str(DB_FILE) + suffix)
+        if not src.exists():
+            continue
+        dst = Path(str(DB_FILE) + f".{ts}.bak{suffix}")
+        try:
+            shutil.copy2(src, dst)
+        except Exception:
+            pass
+
+    try:
+        groups: dict[str, list[Path]] = {"": [], "-wal": [], "-shm": []}
+        for suffix in groups:
+            pattern = DB_FILE.name + ".*.bak" + suffix
+            files = sorted(
+                DB_DIR.glob(pattern),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            groups[suffix] = files
+
+        for suffix, files in groups.items():
+            for old in files[keep:]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 
 DEFAULT_EPHEMERAL_DELAY = 60.0
 MIN_TG_MUTE_SEC = 60
@@ -110,9 +204,18 @@ if not log.handlers:
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+_persist_ok = _check_persistence()
+
 log.info("Config loaded | cwd=%s | admin=%s | admin_thread=%s | report_chat=%s | report_thread=%s",
          Path.cwd(), ADMIN_CHAT_ID, ADMIN_THREAD_ID, REPORT_CHAT_ID, REPORT_THREAD_ID)
-log.info("DB path → %s", DB_PATH)
+log.info("DB path → %s (dir=%s, persist=%s)",
+         DB_PATH, DB_DIR, "yes" if _persist_ok else "NEW/UNKNOWN")
+
+if not _persist_ok:
+    log.warning(
+        "⚠️  Маркер персистентности отсутствует — это первый запуск "
+        "либо volume НЕ сохраняется между пересборками."
+    )
 
 
 _acted = contextvars.ContextVar("worm_acted", default=False)
@@ -497,10 +600,6 @@ LINK_RE = re.compile(r"(https?://|t\.me/|telegram\.me/|@[A-Za-z0-9_]{5,})", re.I
 
 
 SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA busy_timeout=5000;
-
 CREATE TABLE IF NOT EXISTS users (
     user_id     INTEGER,
     chat_id     INTEGER,
@@ -637,8 +736,7 @@ SETTINGS_MIGRATIONS = [
 
 def _sync_init_db() -> None:
     with sqlite3.connect(DB_PATH, timeout=15.0) as conn:
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        _apply_pragmas(conn)
         conn.executescript(SCHEMA)
         cols = {row[1] for row in conn.execute("PRAGMA table_info(settings)")}
         for col, ddl in SETTINGS_MIGRATIONS:
@@ -3702,6 +3800,10 @@ async def _run_bot():
         pass
     finally:
         log.info("Shutting down…")
+        try:
+            await asyncio.to_thread(_wal_checkpoint)
+        except Exception:
+            pass
         for step in (app.updater.stop, app.stop, app.shutdown):
             try:
                 await step()
@@ -3710,6 +3812,7 @@ async def _run_bot():
 
 
 def main():
+    _backup_rotate(keep=5)
     _sync_init_db()
     log.info("Bot starting…")
     while True:
