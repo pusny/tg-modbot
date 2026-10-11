@@ -1885,67 +1885,67 @@ async def cmd_activate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await eph(
         msg,
         "✅ <b>Чат активирован!</b>\n"
-        "Теперь бот работает в полную силу.\n"
         f"Список команд: <code>помощь</code>",
         parse_mode=ParseMode.HTML,
     )
 
 
-HELP_HEADER = "🛠 <b>Модератор-бот</b>\n\n"
+HELP_HEADER = "<b>🛠 Команды</b>\n"
 
 HELP_BLOCKS = {
     "ranks_senior_admin": (
-        "<b>Управление рангами:</b>\n"
-        "• <code>выдатьранг алиас</code> — реплай на сообщение\n"
-        "• <code>снятьранг</code> — реплай на сообщение\n"
-        "• <code>роли</code> — кто в чате имеет ранг\n"
-        "• <code>ранги</code> — список доступных алиасов\n\n",
+        "<b>👑 Управление рангами</b>\n"
+        "<code>выдатьранг [алиас]</code> — <code>выдатьранг мл_мод</code> (реплай)\n"
+        "<code>снятьранг</code> — реплай на сообщение\n"
+        "<code>роли</code> — <code>роли</code>\n"
+        "<code>ранги</code> — <code>ранги</code>\n"
+        "алиасы: owner / senior_admin / junior_admin / senior_mod / junior_mod / user\n\n",
         RANK_SENIOR_ADMIN,
     ),
     "settings": (
-        "<b>Настройки авто-действий:</b>\n"
-        "• <code>настройки</code> — текущие значения и справка\n\n",
+        "<b>⚙️ Настройки</b>\n"
+        "<code>настройки</code> — <code>настройки</code>\n\n",
         RANK_SENIOR_ADMIN,
     ),
     "mod_junior_admin": (
-        "<b>Админ-команды (реплай на сообщение):</b>\n"
-        "• <code>бан [1д] [причина]</code>\n"
-        "• <code>разбан</code>\n\n",
+        "<b>🛡 Админ-команды</b> (реплай)\n"
+        "<code>бан [время] [причина]</code> — <code>бан 1д спам</code>\n"
+        "<code>разбан</code> — реплай на сообщение\n\n",
         RANK_JUNIOR_ADMIN,
     ),
     "mod_senior_mod": (
-        "<b>Старший модератор:</b>\n"
-        "• <code>триггер добавить слово [варн|мут|кик|бан]</code>\n"
-        "• <code>триггер удалить слово</code>\n"
-        "• <code>триггер список</code>\n"
-        "• <code>ссылки вкл</code> / <code>ссылки выкл</code> — для текущей темы\n\n",
+        "<b>⚔ Старший модератор</b>\n"
+        "<code>триггер добавить [слово] [варн|мут|кик|бан]</code> — <code>триггер добавить мат бан</code>\n"
+        "<code>триггер удалить [слово]</code> — <code>триггер удалить мат</code>\n"
+        "<code>триггер список</code> — <code>триггер список</code>\n"
+        "<code>ссылки вкл</code> / <code>ссылки выкл</code> — <code>ссылки выкл</code>\n\n",
         RANK_SENIOR_MOD,
     ),
     "mod_junior_mod": (
-        "<b>Модерация (реплай на сообщение):</b>\n"
-        "• <code>мод</code> — меню кнопок\n"
-        "• <code>кик</code>\n"
-        "• <code>мут 10м</code> (без времени — дефолт из настроек)\n"
-        "• <code>размут</code>\n"
-        "• <code>варн [1ч]</code> (без времени — дефолт из настроек)\n"
-        "• <code>анварн</code>\n"
-        "• <code>варны</code>\n"
-        "• <code>чистка N</code> — удалить N последних сообщений\n"
-        "• <code>ранги</code> — список доступных алиасов\n\n"
-        "<b>Кружки:</b>\n"
-        "• <code>создатькружок имя</code>\n"
-        "• <code>удалитькружок имя</code>\n\n",
+        "<b>⚔ Модерация</b> (реплай)\n"
+        "<code>мод</code> — <code>мод</code>\n"
+        "<code>мут [время]</code> — <code>мут 10м</code>\n"
+        "<code>размут</code> — реплай на сообщение\n"
+        "<code>кик</code> — реплай на сообщение\n"
+        "<code>варн [время]</code> — <code>варн 1ч</code>\n"
+        "<code>анварн</code> — реплай на сообщение\n"
+        "<code>варны</code> — <code>варны</code>\n"
+        "<code>чистка [N]</code> — <code>чистка 30</code>\n\n"
+        "<b>👥 Кружки</b>\n"
+        "<code>создатькружок [имя]</code> — <code>создатькружок Коты</code>\n"
+        "<code>удалитькружок [имя]</code> — <code>удалитькружок Коты</code>\n\n",
         RANK_JUNIOR_MOD,
     ),
     "everyone": (
-        "<b>Доступно всем:</b>\n"
-        "• <code>репорт причина</code> — жалоба (реплай)\n"
-        "• <code>профиль</code> — профиль (реплай) или себя\n"
-        "• <code>я</code> — свой профиль\n"
-        "• <code>вступить имя</code> — войти в кружок\n"
-        "• <code>выйти имя</code> — покинуть кружок\n"
-        "• <code>инфокружка имя</code> — состав кружка\n"
-        "• <code>помощь</code>\n",
+        "<b>👤 Всем</b>\n"
+        "<code>помощь</code> — <code>помощь</code>\n"
+        "<code>я</code> — <code>я</code>\n"
+        "<code>профиль</code> — реплай на сообщение\n"
+        "<code>репорт [причина]</code> — <code>репорт спамит</code> (реплай)\n"
+        "<code>кружки</code> — <code>кружки</code>\n"
+        "<code>вступить [имя]</code> — <code>вступить Коты</code>\n"
+        "<code>выйти [имя]</code> — <code>выйти Коты</code>\n"
+        "<code>инфокружка [имя]</code> — <code>инфокружка Коты</code>\n",
         RANK_USER,
     ),
 }
@@ -1953,12 +1953,46 @@ HELP_BLOCKS = {
 
 async def build_help(bot, chat_id: int, user_id: int) -> str:
     rank = await resolve_rank(bot, chat_id, user_id)
-    lines = [HELP_HEADER]
-    lines.append(f"Твой ранг: <b>{RANK_NAMES.get(rank, '—')}</b>\n\n")
+    lines = [HELP_HEADER, f"Твой ранг: <b>{RANK_NAMES.get(rank, '—')}</b>\n\n"]
     for _, (text, min_rank) in HELP_BLOCKS.items():
         if rank >= min_rank:
             lines.append(text)
     return "".join(lines)
+
+
+def _settings_help() -> str:
+    return (
+        "<b>⚙️ Настройки — команды</b>\n"
+        "формат времени: <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code> · <code>0</code>\n\n"
+        "<b>тумблеры</b>\n"
+        "<code>настройки антиспам вкл|выкл</code> — <code>настройки антиспам выкл</code>\n"
+        "<code>настройки антирейд вкл|выкл</code> — <code>настройки антирейд выкл</code>\n"
+        "<code>настройки триггеры вкл|выкл</code> — <code>настройки триггеры выкл</code>\n"
+        "<code>настройки ссылки вкл|выкл</code> — <code>настройки ссылки выкл</code>\n\n"
+        "<b>числа</b>\n"
+        "<code>настройки варнлимит N</code> — <code>настройки варнлимит 3</code>\n"
+        "<code>настройки срварн N</code> — <code>настройки срварн 3</code>\n"
+        "<code>настройки рейдвходы N</code> — <code>настройки рейдвходы 10</code>\n"
+        "<code>настройки флуд N [время]</code> — <code>настройки флуд 7 10с</code>\n\n"
+        "<b>время наказаний</b>\n"
+        "<code>настройки мутфлуд [время]</code> — <code>настройки мутфлуд 30м</code>\n"
+        "<code>настройки автомут [время]</code> — <code>настройки автомут 1ч</code>\n"
+        "<code>настройки триггермут [время]</code> — <code>настройки триггермут 1ч</code>\n"
+        "<code>настройки дефмут [время]</code> — <code>настройки дефмут 10м</code>\n"
+        "<code>настройки дефварн [время]</code> — <code>настройки дефварн 1ч</code>\n"
+        "<code>настройки дефбан [время]</code> — <code>настройки дефбан 1д</code>\n"
+        "<code>настройки триггерварн [время]</code> — <code>настройки триггерварн 1ч</code>\n"
+        "<code>настройки триггербан [время]</code> — <code>настройки триггербан 1д</code>\n\n"
+        "<b>действие при N варнах</b>\n"
+        "<code>настройки варндействие мут|бан|кик</code> — <code>настройки варндействие бан</code>\n\n"
+        "<b>наказание за ссылки</b>\n"
+        "<code>настройки ссылкидействие ничего|варн|мут|кик|бан</code> — <code>настройки ссылкидействие варн</code>\n\n"
+        "<b>антирейд</b>\n"
+        "<code>настройки рейдокно [время]</code> — <code>настройки рейдокно 30с</code>\n"
+        "<code>настройки рейдкулдаун [время]</code> — <code>настройки рейдкулдаун 30м</code>\n\n"
+        "<b>служебное</b>\n"
+        "<code>настройки удаление [время]</code> — <code>настройки удаление 60с</code>\n"
+    )
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2101,7 +2135,6 @@ def require_reply(fn):
 
 
 def mod_once(fn):
-    """Пропускает мод-команды старше N сек и дубликаты (chat_id, message_id)."""
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
         user = update.effective_user
@@ -2180,7 +2213,7 @@ async def cmd_setrank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await log_action(ctx.bot, user, f"👑 Выдача ранга: {RANK_NAMES[rank]}", target, "",
                      msg.chat.id, reply_msg_id=msg.reply_to_message.message_id)
 
-    tail = "" if tag_ok else "\n<i>(тег не удалось поставить — проверь, что бот админ и у него есть право «Управление тегами»)</i>"
+    tail = "" if tag_ok else "\n<i>(тег не удалось поставить)</i>"
     await eph(
         msg,
         f"✅ Выдано: {target.mention_html()} → <b>{RANK_NAMES[rank]}</b>{tail}",
@@ -2537,7 +2570,10 @@ async def cmd_unwarn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @mod_action
 async def cmd_warns(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
-    if msg is None or user is None:
+    if msg is None or user is None or msg.chat.type == "private":
+        return
+    my_rank = await resolve_rank(ctx.bot, msg.chat.id, user.id)
+    if await _rank_denied(update, RANK_JUNIOR_MOD, my_rank):
         return
     settings = await get_settings(msg.chat.id)
     warn_limit = int(_s(settings, "warn_limit", 3))
@@ -2791,8 +2827,7 @@ async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "<b>Управление триггерами</b>\n"
             "<code>триггер добавить слово варн</code>\n"
             "<code>триггер удалить слово</code>\n"
-            "<code>триггер список</code>\n\n"
-            f"Действия: <b>{ACTION_HINTS}</b>",
+            "<code>триггер список</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2865,6 +2900,36 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               f"✅ Кружок <b>{esc(name)}</b> создан.\n"
               f"Вступить: <code>вступить {esc(name)}</code>",
               parse_mode=ParseMode.HTML)
+
+
+@mod_action
+async def cmd_circles_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or msg.chat.type == "private":
+        return
+
+    rows = await db_exec(
+        "SELECT id, name, owner_id, thread_id FROM circles WHERE chat_id=? ORDER BY id",
+        (msg.chat.id,), fetch="all",
+    ) or []
+
+    if not rows:
+        await eph(msg, "📭 Кружков пока нет.", parse_mode=ParseMode.HTML)
+        return
+
+    lines = ["<b>👥 Кружки</b>"]
+    for r in rows:
+        cid = r["id"]
+        cnt_row = await db_exec(
+            "SELECT COUNT(*) AS n FROM circle_members WHERE circle_id=?",
+            (cid,), fetch="one",
+        )
+        cnt = int(cnt_row["n"]) if cnt_row else 0
+        thread_id = r["thread_id"] or 0
+        thread_note = f" (тема <code>{thread_id}</code>)" if thread_id else ""
+        lines.append(f"• <b>{esc(r['name'])}</b> — {cnt} участн.{thread_note}")
+
+    await eph(msg, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @mod_action
@@ -3216,46 +3281,6 @@ LINK_ACTION_DISPLAY = {
 }
 
 
-def _settings_help() -> str:
-    return (
-        "<b>Управление настройками</b>\n\n"
-        "<b>Время пишется так:</b> <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code>\n"
-        "(с=секунды, м=минуты, ч=часы, д=дни). <b>0 = вечно/навсегда</b>.\n\n"
-        "<b>Тумблеры (вкл / выкл):</b>\n"
-        "• <code>настройки антиспам вкл|выкл</code>\n"
-        "• <code>настройки антирейд вкл|выкл</code>\n"
-        "• <code>настройки триггеры вкл|выкл</code>\n"
-        "• <code>настройки ссылки вкл|выкл</code> — глобальный запрет ссылок\n\n"
-        "<b>Числа:</b>\n"
-        "• <code>настройки варнлимит N</code> — варнов до авто-наказания (команда)\n"
-        "• <code>настройки срварн N</code> — отдельный лимит варнов от триггеров\n"
-        "• <code>настройки рейдвходы N</code> — сколько входов за окно → алерт\n"
-        "• <code>настройки флуд N 10с</code> — N сообщений за время\n\n"
-        "<b>Время наказаний:</b>\n"
-        "• <code>настройки мутфлуд 30м</code> — мут за флуд\n"
-        "• <code>настройки автомут 1ч</code> — длительность авто-мута (в т.ч. при варнах и ссылках)\n"
-        "• <code>настройки триггермут 1ч</code> — мут по триггеру\n"
-        "• <code>настройки дефмут 10м</code> — мут без указания времени\n"
-        "• <code>настройки дефварн 1ч</code> — дефолтный срок варна\n"
-        "• <code>настройки дефбан 1д</code> — дефолтный срок бана\n"
-        "• <code>настройки триггерварн 1ч</code> — срок варна от триггера\n"
-        "• <code>настройки триггербан 1д</code> — срок бана от триггера\n"
-        "(для всех этих настроек <b>0 = вечно/навсегда</b>)\n\n"
-        "<b>Наказание за ссылки:</b>\n"
-        "• <code>настройки ссылкидействие ничего|варн|мут|кик|бан</code>\n"
-        "(сроки берутся как у <code>варндействие</code>: дефварн / автомут / дефбан)\n\n"
-        "<b>Антирейд окна:</b>\n"
-        "• <code>настройки рейдокно 30с</code>\n"
-        "• <code>настройки рейдкулдаун 30м</code>\n\n"
-        "<b>Служебное:</b>\n"
-        "• <code>настройки удаление 60с</code> — через сколько бот удаляет свои сообщения (0 = не удалять)\n\n"
-        "<b>Действие при N варнах:</b>\n"
-        "• <code>настройки варндействие мут</code> — мут\n"
-        "• <code>настройки варндействие бан</code> — бан (по умолчанию)\n"
-        "• <code>настройки варндействие кик</code> — кик\n"
-    )
-
-
 @mod_action
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
@@ -3281,27 +3306,27 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return fmt_seconds(v) if v > 0 else "вечно"
 
         cur = (
-            f"<b>Текущие настройки</b>\n"
-            f"🔹 Антиспам: <b>{'вкл' if s['antispam'] else 'выкл'}</b>\n"
-            f"🔹 Антирейд: <b>{'вкл' if s['antiraid'] else 'выкл'}</b> "
+            f"<b>⚙️ Текущие настройки</b>\n\n"
+            f"антиспам: <b>{'вкл' if s['antispam'] else 'выкл'}</b>\n"
+            f"антирейд: <b>{'вкл' if s['antiraid'] else 'выкл'}</b> "
             f"(<b>{_s(s, 'antiraid_joins', 10)}</b> входов / <b>{fmt_seconds(int(_s(s, 'antiraid_window', 30)))}</b>, "
             f"кулдаун <b>{fmt_seconds(int(_s(s, 'antiraid_lookback', 1800)))}</b>)\n"
-            f"🔹 Триггеры: <b>{'вкл' if s['triggers_on'] else 'выкл'}</b>\n"
-            f"🔹 Ссылки запрещены: <b>{'да' if _s(s, 'links_forbidden', 0) else 'нет'}</b>\n"
-            f"🔹 Наказание за ссылки: <b>{cur_link}</b>\n"
-            f"🔹 Флуд: <b>{s['flood_limit']}</b> сообщ. / <b>{fmt_seconds(int(s['flood_window']))}</b>\n"
-            f"🔹 Мут за флуд: <b>{_t('flood_mute_sec')}</b>\n"
-            f"🔹 Варнов до авто-наказания: <b>{_s(s, 'warn_limit', 3)}</b>\n"
-            f"🔹 Варнов у триггеров: <b>{_s(s, 'trig_warn_limit', 3)}</b>\n"
-            f"🔹 Действие при N варнах: <b>{cur_action}</b>\n"
-            f"🔹 Авто-мут: <b>{_t('auto_mute_sec')}</b>\n"
-            f"🔹 Мут по триггеру: <b>{_t('trig_mute_sec')}</b>\n"
-            f"🔹 Мут по умолчанию: <b>{_t('default_mute_sec')}</b>\n"
-            f"🔹 Срок варна по умолчанию: <b>{_t('default_warn_sec')}</b>\n"
-            f"🔹 Срок бана по умолчанию: <b>{_t('default_ban_sec')}</b>\n"
-            f"🔹 Срок варна от триггера: <b>{_t('trig_warn_sec')}</b>\n"
-            f"🔹 Срок бана от триггера: <b>{_t('trig_ban_sec')}</b>\n"
-            f"🔹 Удаление своих сообщений: <b>{fmt_seconds(int(_s(s, 'ephemeral_delay', 60)))}</b>\n\n"
+            f"триггеры: <b>{'вкл' if s['triggers_on'] else 'выкл'}</b>\n"
+            f"ссылки запрещены: <b>{'да' if _s(s, 'links_forbidden', 0) else 'нет'}</b>\n"
+            f"наказание за ссылки: <b>{cur_link}</b>\n"
+            f"флуд: <b>{s['flood_limit']}</b> сообщ. / <b>{fmt_seconds(int(s['flood_window']))}</b>\n"
+            f"мут за флуд: <b>{_t('flood_mute_sec')}</b>\n"
+            f"варнлимит: <b>{_s(s, 'warn_limit', 3)}</b>\n"
+            f"срварн: <b>{_s(s, 'trig_warn_limit', 3)}</b>\n"
+            f"варндействие: <b>{cur_action}</b>\n"
+            f"автомут: <b>{_t('auto_mute_sec')}</b>\n"
+            f"триггермут: <b>{_t('trig_mute_sec')}</b>\n"
+            f"дефмут: <b>{_t('default_mute_sec')}</b>\n"
+            f"дефварн: <b>{_t('default_warn_sec')}</b>\n"
+            f"дефбан: <b>{_t('default_ban_sec')}</b>\n"
+            f"триггерварн: <b>{_t('trig_warn_sec')}</b>\n"
+            f"триггербан: <b>{_t('trig_ban_sec')}</b>\n"
+            f"удаление: <b>{fmt_seconds(int(_s(s, 'ephemeral_delay', 60)))}</b>\n\n"
             + _settings_help()
         )
         await eph(msg, cur, parse_mode=ParseMode.HTML)
@@ -3311,7 +3336,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if key_raw in ("flood", "флуд"):
         if len(parts) < 4:
-            await eph(msg, "❌ Использование: <code>настройки флуд N 10с</code>",
+            await eph(msg, "❌ <code>настройки флуд 7 10с</code>",
                       parse_mode=ParseMode.HTML); return
         try:
             n = int(parts[2])
@@ -3324,7 +3349,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await set_setting(msg.chat.id, "flood_window", w)
         await log_action(ctx.bot, user, f"⚙️ flood → {n} за {fmt_seconds(w)}", "—", "", msg.chat.id)
         await eph(msg,
-                  f"✅ Флуд-лимит: <b>{n}</b> сообщ. за <b>{fmt_seconds(w)}</b>",
+                  f"✅ флуд: <b>{n}</b> / <b>{fmt_seconds(w)}</b>",
                   parse_mode=ParseMode.HTML)
         return
 
@@ -3342,21 +3367,21 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                               ("none", "warn", "mute", "kick", "ban"))
         if len(parts) < 3:
             await eph(msg,
-                      f"❌ Использование: <code>настройки ссылкидействие ничего|варн|мут|кик|бан</code>\n"
-                      f"Доступно: <b>{variants}</b>",
+                      f"❌ <code>настройки ссылкидействие ничего|варн|мут|кик|бан</code>\n"
+                      f"доступно: <b>{variants}</b>",
                       parse_mode=ParseMode.HTML)
             return
         raw = parts[2].lower()
         val = LINK_ACTION_ALIASES.get(raw)
         if val is None:
-            await eph(msg, f"❌ Значение должно быть: <b>{variants}</b>",
+            await eph(msg, f"❌ доступно: <b>{variants}</b>",
                       parse_mode=ParseMode.HTML)
             return
         await set_setting(msg.chat.id, "link_action", val)
         await log_action(ctx.bot, user,
                          f"⚙️ link_action → {LINK_ACTION_DISPLAY[val]}",
                          "—", "", msg.chat.id)
-        await eph(msg, f"✅ ссылкидействие → <b>{LINK_ACTION_DISPLAY[val]}</b>",
+        await eph(msg, f"✅ ссылкидействие: <b>{LINK_ACTION_DISPLAY[val]}</b>",
                   parse_mode=ParseMode.HTML)
         return
 
@@ -3365,26 +3390,26 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pretty = " · ".join(WARN_ACTION_DISPLAY[v] for v in variants)
         if len(parts) < 3:
             await eph(msg,
-                      f"❌ Использование: <code>настройки {key_raw} мут|бан|кик</code>",
+                      f"❌ <code>настройки варндействие мут|бан|кик</code>",
                       parse_mode=ParseMode.HTML)
             return
         raw = parts[2].lower()
         val = WARN_ACTION_ALIASES.get(raw)
         if val is None or val not in variants:
-            await eph(msg, f"❌ Значение должно быть: <b>{pretty}</b>",
+            await eph(msg, f"❌ доступно: <b>{pretty}</b>",
                       parse_mode=ParseMode.HTML)
             return
         await set_setting(msg.chat.id, key, val)
         await log_action(ctx.bot, user,
                          f"⚙️ {key} → {WARN_ACTION_DISPLAY[val]}",
                          "—", "", msg.chat.id)
-        await eph(msg, f"✅ {key_raw} → <b>{WARN_ACTION_DISPLAY[val]}</b>",
+        await eph(msg, f"✅ варндействие: <b>{WARN_ACTION_DISPLAY[val]}</b>",
                   parse_mode=ParseMode.HTML)
         return
 
     if key in BOOL_SETTINGS:
         if len(parts) < 3:
-            await eph(msg, f"❌ Использование: <code>настройки {key_raw} вкл|выкл</code>",
+            await eph(msg, f"❌ <code>настройки {key_raw} вкл|выкл</code>",
                       parse_mode=ParseMode.HTML); return
         raw = parts[2].lower()
         if raw in ("on", "1", "вкл", "включить", "да", "yes", "true"):
@@ -3392,20 +3417,20 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif raw in ("off", "0", "выкл", "выключить", "нет", "no", "false"):
             val = 0
         else:
-            await eph(msg, "❌ Значение должно быть <b>вкл</b> или <b>выкл</b>."); return
+            await eph(msg, "❌ нужно <b>вкл</b> или <b>выкл</b>."); return
         await set_setting(msg.chat.id, key, val)
         await log_action(ctx.bot, user, f"⚙️ {key} → {'вкл' if val else 'выкл'}", "—", "", msg.chat.id)
-        await eph(msg, f"✅ {key_raw} → <b>{'вкл' if val else 'выкл'}</b>",
+        await eph(msg, f"✅ {key_raw}: <b>{'вкл' if val else 'выкл'}</b>",
                   parse_mode=ParseMode.HTML)
         return
 
     if len(parts) < 3:
         if key in TIME_SETTINGS:
-            await eph(msg, f"❌ Использование: <code>настройки {key_raw} 30м</code>\n"
-                          f"Формат: 10с / 30м / 1ч / 2д / 0 (вечно)",
+            await eph(msg, f"❌ <code>настройки {key_raw} [время]</code>\n"
+                          f"формат: 10с / 30м / 1ч / 2д / 0",
                       parse_mode=ParseMode.HTML)
         else:
-            await eph(msg, f"❌ Использование: <code>настройки {key_raw} N</code>",
+            await eph(msg, f"❌ <code>настройки {key_raw} N</code>",
                       parse_mode=ParseMode.HTML)
         return
 
@@ -3416,26 +3441,26 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             secs = parse_setting_time(raw)
             if secs <= 0:
-                await eph(msg, "❌ Не распознал время. Пример: <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code> · <code>0</code>",
+                await eph(msg, "❌ формат: <code>10с</code> · <code>30м</code> · <code>1ч</code> · <code>2д</code> · <code>0</code>",
                           parse_mode=ParseMode.HTML)
                 return
         await set_setting(msg.chat.id, key, secs)
         pretty = fmt_seconds(secs) if secs > 0 else "вечно"
         await log_action(ctx.bot, user, f"⚙️ {key} → {pretty}", "—", "", msg.chat.id)
-        await eph(msg, f"✅ {key_raw} → <b>{pretty}</b>",
+        await eph(msg, f"✅ {key_raw}: <b>{pretty}</b>",
                   parse_mode=ParseMode.HTML)
         return
 
     try:
         val = int(parts[2])
     except ValueError:
-        await eph(msg, "❌ Нужно число."); return
+        await eph(msg, "❌ нужно число."); return
     if val < 0:
-        await eph(msg, "❌ Число не может быть отрицательным."); return
+        await eph(msg, "❌ число не может быть отрицательным."); return
 
     await set_setting(msg.chat.id, key, val)
     await log_action(ctx.bot, user, f"⚙️ {key} → {val}", "—", "", msg.chat.id)
-    await eph(msg, f"✅ {key_raw} → <b>{val}</b>", parse_mode=ParseMode.HTML)
+    await eph(msg, f"✅ {key_raw}: <b>{val}</b>", parse_mode=ParseMode.HTML)
 
 
 async def _post_init(app: Application):
@@ -3498,6 +3523,8 @@ RU_ALIASES = [
     (r"^выдатьранг\s+\S+$",                cmd_setrank),
     (r"^снятьранг$",                       cmd_unrank),
     (r"^создатькружок(?:\s+.+)?$",         cmd_create_circle),
+    (r"^кружки$",                          cmd_circles_list),
+    (r"^списоккружков$",                   cmd_circles_list),
     (r"^вступить(?:\s+.+)?$",              cmd_join),
     (r"^выйти(?:\s+.+)?$",                 cmd_leave),
     (r"^инфокружка(?:\s+.+)?$",            cmd_circle_info),
@@ -3572,6 +3599,7 @@ async def _build_app() -> Application:
     app.add_handler(CommandHandler("trigger", cmd_trigger, filters=G))
 
     app.add_handler(CommandHandler("create_circle", cmd_create_circle, filters=G))
+    app.add_handler(CommandHandler("circles", cmd_circles_list, filters=G))
     app.add_handler(CommandHandler("join", cmd_join, filters=G))
     app.add_handler(CommandHandler("leave", cmd_leave, filters=G))
     app.add_handler(CommandHandler("circle_info", cmd_circle_info, filters=G))
