@@ -60,7 +60,6 @@ REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
 
 # ─────────────────────────────────────────────────────────────
 #  DB PATH — приоритет: DATA_DIR > DB_PATH > "bot.db"
-#  bothost монтирует персистентный том в /app/data (DATA_DIR)
 # ─────────────────────────────────────────────────────────────
 
 _data_dir = (os.getenv("DATA_DIR") or "").strip()
@@ -424,7 +423,9 @@ async def safe(coro_fn, *args, retries: int = 3, **kwargs):
                     or "message to be replied" in msg
                     or "message can't be deleted" in msg
                     or "chat not found" in msg
-                    or "too many requests" in msg):
+                    or "too many requests" in msg
+                    or "message is too long" in msg
+                    or "message_too_long" in msg):
                 log.debug("safe(): %s", e)
             else:
                 log.debug("safe(): non-network error — %s", e)
@@ -3046,7 +3047,13 @@ async def cmd_circles_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     rows = await db_exec(
-        "SELECT id, name FROM circles WHERE chat_id=? ORDER BY id",
+        """
+        SELECT c.id, c.name,
+               (SELECT COUNT(*) FROM circle_members m WHERE m.circle_id = c.id) AS cnt
+        FROM circles c
+        WHERE c.chat_id=?
+        ORDER BY c.id
+        """,
         (msg.chat.id,), fetch="all",
     ) or []
 
@@ -3054,17 +3061,28 @@ async def cmd_circles_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, "📭 Кружков пока нет.", parse_mode=ParseMode.HTML)
         return
 
-    lines = ["<b>👥 Кружки</b>"]
-    for r in rows:
-        cid = r["id"]
-        cnt_row = await db_exec(
-            "SELECT COUNT(*) AS n FROM circle_members WHERE circle_id=?",
-            (cid,), fetch="one",
-        )
-        cnt = int(cnt_row["n"]) if cnt_row else 0
-        lines.append(f"• <b>{esc(r['name'])}</b> — {cnt} участн.")
+    header = f"<b>👥 Кружки</b> — всего: {len(rows)}\n"
+    lines = [f"• <b>{esc(r['name'])}</b> — {r['cnt']} участн." for r in rows]
 
-    await eph(msg, "\n".join(lines), parse_mode=ParseMode.HTML)
+    LIMIT = 3500
+    chunk = header
+    sent_any = False
+
+    for line in lines:
+        if len(chunk) + len(line) + 1 > LIMIT:
+            await eph(msg, chunk, parse_mode=ParseMode.HTML,
+                      disable_web_page_preview=True)
+            sent_any = True
+            chunk = ""
+        chunk += line + "\n"
+
+    if chunk.strip():
+        await eph(msg, chunk, parse_mode=ParseMode.HTML,
+                  disable_web_page_preview=True)
+        sent_any = True
+
+    if not sent_any:
+        await eph(msg, "📭 Кружков пока нет.", parse_mode=ParseMode.HTML)
 
 
 @mod_action
@@ -3135,7 +3153,27 @@ async def cmd_delete_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ <code>удалитькружок [имя]</code>",
                   parse_mode=ParseMode.HTML); return
-    c = await get_circle_by_name(msg.chat.id, 0, parts[1].strip())
+
+    arg = parts[1].strip()
+
+    if arg.lower() in ("все", "all", "*"):
+        if my_rank < RANK_SENIOR_ADMIN:
+            await eph(msg, "❌ Только старший админ может сносить все кружки.")
+            return
+        rows = await db_exec(
+            "SELECT id FROM circles WHERE chat_id=?",
+            (msg.chat.id,), fetch="all",
+        ) or []
+        for r in rows:
+            await delete_circle(r["id"])
+        await eph(msg, f"🗑 Удалено кружков: <b>{len(rows)}</b>",
+                  parse_mode=ParseMode.HTML)
+        await log_action(ctx.bot, user,
+                         f"🗑 Массовое удаление кружков ({len(rows)})",
+                         "—", "", msg.chat.id)
+        return
+
+    c = await get_circle_by_name(msg.chat.id, 0, arg)
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     if c["owner_id"] != user.id and my_rank < RANK_SENIOR_ADMIN:
