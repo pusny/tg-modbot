@@ -222,14 +222,14 @@ def _log_activation_key(chat_id: int, chat_title: str, key: str):
     log.warning("  KEY ACTIVATION")
     log.warning("  Chat: %s (%s)", chat_title, chat_id)
     log.warning("  Key:  %s", key)
-    log.warning("  Usage in chat: /activate %s", key)
+    log.warning("  Usage in chat: активация %s", key)
     log.warning(bar)
     try:
         print(bar, flush=True)
         print(f"  KEY ACTIVATION", flush=True)
         print(f"  Chat: {chat_title} ({chat_id})", flush=True)
         print(f"  Key:  {key}", flush=True)
-        print(f"  Usage in chat: /activate {key}", flush=True)
+        print(f"  Usage in chat: активация {key}", flush=True)
         print(bar, flush=True)
     except Exception:
         pass
@@ -1419,7 +1419,8 @@ async def activation_mw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (msg.text or "").strip().lower()
-    if text.startswith("/activate") or text.startswith("активация") or text.startswith("activate"):
+    if (text.startswith("/activate") or text.startswith("активация")
+            or text.startswith("activate") or text.startswith("/активация")):
         return
 
     if await is_chat_activated(msg.chat.id):
@@ -1871,8 +1872,32 @@ async def cmd_activate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe(msg.delete)
         return
 
-    parts = (msg.text or "").split()
+    text = (msg.text or "").strip()
+    low = text.lower().lstrip("/")
+    parts = low.split()
+
     if len(parts) < 2:
+        is_tg_admin = False
+        try:
+            m = await ctx.bot.get_chat_member(chat_id, user.id)
+            if m.status in ("creator", "administrator"):
+                is_tg_admin = True
+        except Exception:
+            pass
+
+        if not is_tg_admin:
+            await safe(msg.delete)
+            return
+
+        existing = await get_pending_key(chat_id)
+        if existing:
+            key = existing["key"]
+        else:
+            key = _gen_key()
+            await set_pending_key(chat_id, key)
+
+        chat_title = msg.chat.title or msg.chat.full_name or str(chat_id)
+        _log_activation_key(chat_id, chat_title, key)
         await safe(msg.delete)
         return
 
@@ -3500,7 +3525,8 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 RU_ALIASES = [
-    (r"^активация(?:\s+\S+)?$",            cmd_activate),
+    (r"^/?активация(?:\s+\S+)?$",          cmd_activate),
+    (r"^/?activate(?:\s+\S+)?$",           cmd_activate),
     (r"^бан$",                             cmd_ban),
     (r"^бан\s+[0-9]+\s*[a-zA-Zа-яА-Я]$",   cmd_ban),
     (r"^бан\s+[0-9]+\s*[a-zA-Zа-яА-Я]\s+.+$", cmd_ban),
