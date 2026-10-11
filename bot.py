@@ -868,8 +868,8 @@ async def create_circle(chat_id: int, name: str, owner_id: int, thread_id: int) 
 
 async def get_circle_by_name(chat_id: int, thread_id: int, name: str):
     return await db_exec(
-        "SELECT * FROM circles WHERE chat_id=? AND thread_id=? AND lower(name)=lower(?)",
-        (chat_id, thread_id, name), fetch="one",
+        "SELECT * FROM circles WHERE chat_id=? AND lower(name)=lower(?) LIMIT 1",
+        (chat_id, name), fetch="one",
     )
 
 
@@ -2901,16 +2901,14 @@ async def cmd_create_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     name = parts[1].strip()[:60]
-    thread_id = msg.message_thread_id or 0
 
-    existing = await get_circle_by_name(msg.chat.id, thread_id, name)
+    existing = await get_circle_by_name(msg.chat.id, 0, name)
     if existing:
-        where = "в этой теме" if thread_id else "в этом чате"
-        await eph(msg, f"❌ {where} уже есть кружок <b>{esc(name)}</b>.",
+        await eph(msg, f"❌ В чате уже есть кружок <b>{esc(name)}</b>.",
                   parse_mode=ParseMode.HTML)
         return
 
-    cid = await create_circle(msg.chat.id, name, user.id, thread_id)
+    cid = await create_circle(msg.chat.id, name, user.id, 0)
     await add_circle_member(cid, user.id)
     await eph(msg,
               f"✅ Кружок <b>{esc(name)}</b> создан.\n"
@@ -2925,7 +2923,7 @@ async def cmd_circles_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     rows = await db_exec(
-        "SELECT id, name, owner_id, thread_id FROM circles WHERE chat_id=? ORDER BY id",
+        "SELECT id, name FROM circles WHERE chat_id=? ORDER BY id",
         (msg.chat.id,), fetch="all",
     ) or []
 
@@ -2941,9 +2939,7 @@ async def cmd_circles_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             (cid,), fetch="one",
         )
         cnt = int(cnt_row["n"]) if cnt_row else 0
-        thread_id = r["thread_id"] or 0
-        thread_note = f" (тема <code>{thread_id}</code>)" if thread_id else ""
-        lines.append(f"• <b>{esc(r['name'])}</b> — {cnt} участн.{thread_note}")
+        lines.append(f"• <b>{esc(r['name'])}</b> — {cnt} участн.")
 
     await eph(msg, "\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -2957,8 +2953,7 @@ async def cmd_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ <code>вступить [имя]</code>",
                   parse_mode=ParseMode.HTML); return
-    thread_id = msg.message_thread_id or 0
-    c = await get_circle_by_name(msg.chat.id, thread_id, parts[1].strip())
+    c = await get_circle_by_name(msg.chat.id, 0, parts[1].strip())
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     await add_circle_member(c["id"], user.id)
@@ -2974,8 +2969,7 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ <code>выйти [имя]</code>",
                   parse_mode=ParseMode.HTML); return
-    thread_id = msg.message_thread_id or 0
-    c = await get_circle_by_name(msg.chat.id, thread_id, parts[1].strip())
+    c = await get_circle_by_name(msg.chat.id, 0, parts[1].strip())
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     await remove_circle_member(c["id"], user.id)
@@ -2991,8 +2985,7 @@ async def cmd_circle_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ <code>инфокружка [имя]</code>",
                   parse_mode=ParseMode.HTML); return
-    thread_id = msg.message_thread_id or 0
-    c = await get_circle_by_name(msg.chat.id, thread_id, parts[1].strip())
+    c = await get_circle_by_name(msg.chat.id, 0, parts[1].strip())
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     members = await circle_members(c["id"])
@@ -3019,8 +3012,7 @@ async def cmd_delete_circle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ <code>удалитькружок [имя]</code>",
                   parse_mode=ParseMode.HTML); return
-    thread_id = msg.message_thread_id or 0
-    c = await get_circle_by_name(msg.chat.id, thread_id, parts[1].strip())
+    c = await get_circle_by_name(msg.chat.id, 0, parts[1].strip())
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     if c["owner_id"] != user.id and my_rank < RANK_SENIOR_ADMIN:
