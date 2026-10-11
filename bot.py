@@ -3097,7 +3097,29 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await eph(msg, "❌ <code>выйти [имя]</code>",
                   parse_mode=ParseMode.HTML); return
-    c = await get_circle_by_name(msg.chat.id, 0, parts[1].strip())
+
+    arg = parts[1].strip()
+
+    if arg.lower() in ("все", "all", "*"):
+        rows = await db_exec(
+            """
+            SELECT c.id FROM circles c
+            JOIN circle_members m ON m.circle_id = c.id
+            WHERE c.chat_id=? AND m.user_id=?
+            """,
+            (msg.chat.id, user.id), fetch="all",
+        ) or []
+        for r in rows:
+            await remove_circle_member(r["id"], user.id)
+        if not rows:
+            await eph(msg, "ℹ️ Ты не в одном кружке.",
+                      parse_mode=ParseMode.HTML)
+        else:
+            await eph(msg, f"🚪 Ты вышел из <b>{len(rows)}</b> кружков.",
+                      parse_mode=ParseMode.HTML)
+        return
+
+    c = await get_circle_by_name(msg.chat.id, 0, arg)
     if not c:
         await eph(msg, "❌ Кружок не найден."); return
     await remove_circle_member(c["id"], user.id)
