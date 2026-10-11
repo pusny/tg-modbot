@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import string
 import time
@@ -55,7 +56,8 @@ ADMIN_CHAT_ID    = _req_int("ADMIN_CHAT_ID")
 ADMIN_THREAD_ID  = _req_int("ADMIN_THREAD_ID", 0) or None
 REPORT_CHAT_ID   = _req_int("REPORT_CHAT_ID")
 REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
-DB_PATH          = os.getenv("DB_PATH", "bot.db")
+
+DB_PATH = "bot.db"
 
 DEFAULT_EPHEMERAL_DELAY = 60.0
 MIN_TG_MUTE_SEC = 60
@@ -111,6 +113,34 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log.info("Config loaded | cwd=%s | admin=%s | admin_thread=%s | report_chat=%s | report_thread=%s",
          Path.cwd(), ADMIN_CHAT_ID, ADMIN_THREAD_ID, REPORT_CHAT_ID, REPORT_THREAD_ID)
+
+
+def _resolve_db_path() -> str:
+    env_path = os.getenv("DB_PATH")
+    if env_path and env_path.strip():
+        return env_path.strip()
+
+    data_dir = os.getenv("DATA_DIR", "/app/data")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except Exception:
+        data_dir = "."
+
+    new_path = os.path.join(data_dir, "bot.db")
+    old_path = "bot.db"
+
+    if (not os.path.exists(new_path)) and os.path.exists(old_path):
+        try:
+            shutil.copy2(old_path, new_path)
+            log.info("DB мигрировала из %s в %s", old_path, new_path)
+        except Exception as e:
+            log.warning("Не удалось мигрировать БД: %s", e)
+
+    return new_path
+
+
+DB_PATH = _resolve_db_path()
+log.info("DB path resolved → %s", DB_PATH)
 
 
 _acted = contextvars.ContextVar("worm_acted", default=False)
