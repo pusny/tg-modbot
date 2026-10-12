@@ -15,6 +15,7 @@ _ensure("python-dotenv", "dotenv")
 
 import asyncio
 import contextvars
+import gc
 import html
 import logging
 import os
@@ -25,6 +26,7 @@ import sqlite3
 import string
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -91,17 +93,20 @@ def _check_persistence() -> bool:
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA busy_timeout=10000;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA wal_autocheckpoint=1000;")
+    conn.execute("PRAGMA cache_size=-8000;")
 
 
-def _wal_checkpoint() -> None:
+def _wal_checkpoint(passive: bool = False) -> None:
     if not DB_FILE.exists():
         return
     try:
         with sqlite3.connect(DB_PATH, timeout=10.0) as c:
             c.execute("PRAGMA busy_timeout=5000;")
-            c.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            mode = "PASSIVE" if passive else "TRUNCATE"
+            c.execute(f"PRAGMA wal_checkpoint({mode});")
     except Exception:
         pass
 
@@ -161,6 +166,12 @@ RANK_CACHE_TTL = 60
 STALE_UPDATE_SEC = 300
 MOD_CMD_FRESH_SEC = 90
 MOD_CMD_DUP_TTL = 900
+
+WATCHDOG_INTERVAL = 60
+WATCHDOG_MAX_FAILS = 5
+MESSAGES_RETENTION_SEC = 86400
+DB_READ_SEMAPHORE = 3
+DB_EXECUTORS = 4
 
 
 from telegram import (
@@ -336,18 +347,59 @@ _pending_tasks: set = set()
 _pending_unmutes: dict = {}
 
 _db_write_lock: Optional[asyncio.Lock] = None
+_db_read_sem: Optional[asyncio.Semaphore] = None
+_db_pool: Optional[ThreadPoolExecutor] = None
 _tg_sem: Optional[asyncio.Semaphore] = None
 _pending_deletes_count = 0
 
 _rank_cache: dict = {}
 _seen_mod_cmds: dict = {}
 
+_watchdog_fails = 0
+_restart_event: Optional[asyncio.Event] = None
+
+
+def _request_restart(reason: str = ""):
+    global _restart_event
+    if _restart_event is not None and not _restart_event.is_set():
+        log.warning("⚠️ restart requested: %s", reason)
+        _restart_event.set()
+
+
+def _get_db_pool() -> ThreadPoolExecutor:
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = ThreadPoolExecutor(
+            max_workers=DB_EXECUTORS,
+            thread_name_prefix="dbexec",
+        )
+    return _db_pool
+
+
+def _get_read_sem() -> asyncio.Semaphore:
+    global _db_read_sem
+    if _db_read_sem is None:
+        _db_read_sem = asyncio.Semaphore(DB_READ_SEMAPHORE)
+    return _db_read_sem
+
+
+def _task_done(task):
+    _pending_tasks.discard(task)
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except Exception:
+        return
+    if exc is not None:
+        log.warning("scheduled task crashed: %s", exc, exc_info=exc)
+
 
 def _schedule(coro):
     try:
         task = asyncio.create_task(coro)
         _pending_tasks.add(task)
-        task.add_done_callback(_pending_tasks.discard)
+        task.add_done_callback(_task_done)
     except Exception as e:
         log.debug("_schedule fail: %s", e)
 
@@ -365,7 +417,7 @@ def _schedule_unmute(bot, chat_id: int, user_id: int, secs: int):
     task = asyncio.create_task(_unmute_later(bot, chat_id, user_id, secs))
     _pending_unmutes[key] = task
     _pending_tasks.add(task)
-    task.add_done_callback(_pending_tasks.discard)
+    task.add_done_callback(_task_done)
 
     def _cleanup(t, k=key):
         if _pending_unmutes.get(k) is t:
@@ -774,7 +826,7 @@ def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None,
     for attempt in range(_retries):
         try:
             with sqlite3.connect(DB_PATH, timeout=10.0) as conn:
-                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA busy_timeout=10000")
                 conn.row_factory = sqlite3.Row
                 cur = conn.execute(query, params)
                 if fetch == "one":
@@ -795,12 +847,19 @@ def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None,
 
 async def db_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
     global _db_write_lock
-    if _db_write_lock is None:
-        _db_write_lock = asyncio.Lock()
+    pool = _get_db_pool()
     if fetch is None:
+        if _db_write_lock is None:
+            _db_write_lock = asyncio.Lock()
         async with _db_write_lock:
-            return await asyncio.to_thread(_sync_exec, query, params, fetch)
-    return await asyncio.to_thread(_sync_exec, query, params, fetch)
+            return await asyncio.get_event_loop().run_in_executor(
+                pool, _sync_exec, query, params, fetch
+            )
+    sem = _get_read_sem()
+    async with sem:
+        return await asyncio.get_event_loop().run_in_executor(
+            pool, _sync_exec, query, params, fetch
+        )
 
 
 async def is_chat_activated(chat_id: int) -> bool:
@@ -1445,9 +1504,52 @@ async def _housekeeping():
                 if now - _seen_mod_cmds[k] > MOD_CMD_DUP_TTL:
                     _seen_mod_cmds.pop(k, None)
 
+            try:
+                _wal_checkpoint(passive=True)
+            except Exception:
+                pass
+
+            try:
+                cutoff = int(time.time()) - MESSAGES_RETENTION_SEC
+                await db_exec(
+                    "DELETE FROM messages WHERE created_at < datetime(?, 'unixepoch')",
+                    (cutoff,),
+                )
+            except Exception as e:
+                log.debug("messages cleanup: %s", e)
+
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
         except Exception as e:
             log.debug("housekeeping: %s", e)
         await asyncio.sleep(300)
+
+
+async def _watchdog(app: Application):
+    global _watchdog_fails
+    while True:
+        try:
+            try:
+                await asyncio.wait_for(app.bot.get_me(), timeout=25)
+                if app.updater is not None and not app.updater.running:
+                    _request_restart("updater.running = False")
+                    return
+                _watchdog_fails = 0
+            except Exception as e:
+                _watchdog_fails += 1
+                log.warning("watchdog: getMe fail (%d/%d): %s",
+                            _watchdog_fails, WATCHDOG_MAX_FAILS, e)
+                if _watchdog_fails >= WATCHDOG_MAX_FAILS:
+                    _request_restart(
+                        f"{_watchdog_fails} getMe фейлов подряд"
+                    )
+                    return
+        except Exception as e:
+            log.debug("watchdog loop err: %s", e)
+        await asyncio.sleep(WATCHDOG_INTERVAL)
 
 
 def mod_action(fn):
@@ -3864,26 +3966,74 @@ async def _start_with_retry() -> Application:
             raise
 
 
+async def _shutdown_app(app: Application):
+    log.info("shutting down app…")
+    for step in (app.updater.stop if app.updater else None,
+                 app.stop, app.shutdown):
+        if step is None:
+            continue
+        try:
+            await step()
+        except Exception as e:
+            log.debug("shutdown step: %s", e)
+    log.info("app shut down.")
+
+
 async def _run_bot():
-    app = await _start_with_retry()
-    _schedule(_punishment_sweeper(app))
-    _schedule(_housekeeping())
-    stop_event = asyncio.Event()
-    try:
-        await stop_event.wait()
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        log.info("Shutting down…")
+    global _restart_event, _watchdog_fails
+
+    cycle = 0
+    while True:
+        cycle += 1
+        log.info("=== app cycle #%d ===", cycle)
+
+        _restart_event = asyncio.Event()
+        _watchdog_fails = 0
+
+        bg_tasks: list = []
+        app: Optional[Application] = None
+
+        try:
+            app = await _start_with_retry()
+
+            t_sweep = asyncio.create_task(_punishment_sweeper(app))
+            t_house = asyncio.create_task(_housekeeping())
+            t_watch = asyncio.create_task(_watchdog(app))
+            bg_tasks = [t_sweep, t_house, t_watch]
+
+            log.info("Bot running (cycle #%d). Ждём сигнала рестарта…", cycle)
+            await _restart_event.wait()
+            log.warning("restart signal received — пересобираю приложение")
+
+        except (KeyboardInterrupt, SystemExit):
+            log.info("Bot stopped by user.")
+            for t in bg_tasks:
+                t.cancel()
+            if app is not None:
+                await _shutdown_app(app)
+            break
+
+        except Exception as e:
+            log.exception("цикл #%d упал: %s", cycle, e)
+
+        for t in bg_tasks:
+            if not t.done():
+                t.cancel()
+        for t in bg_tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if app is not None:
+            await _shutdown_app(app)
+
         try:
             await asyncio.to_thread(_wal_checkpoint)
         except Exception:
             pass
-        for step in (app.updater.stop, app.stop, app.shutdown):
-            try:
-                await step()
-            except Exception:
-                pass
+
+        await asyncio.sleep(2)
 
 
 def main():
