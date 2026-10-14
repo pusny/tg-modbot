@@ -191,6 +191,9 @@ MESSAGES_RETENTION_SEC = 86400
 DB_READ_SEMAPHORE = 3
 DB_EXECUTORS = 4
 
+ASR_IDLE_UNLOAD_SEC = 180
+HOUSEKEEPING_INTERVAL = 300
+
 
 from telegram import (
     BotCommand,
@@ -380,6 +383,7 @@ _restart_event: Optional[asyncio.Event] = None
 _asr_model = None
 _asr_recognizer = None
 _asr_lock: Optional[asyncio.Lock] = None
+_asr_last_used: float = 0.0
 _ffmpeg_path: Optional[str] = None
 
 
@@ -487,6 +491,34 @@ def _load_asr():
     return _asr_model, _asr_recognizer
 
 
+def _unload_asr():
+    global _asr_model, _asr_recognizer
+    if _asr_model is None and _asr_recognizer is None:
+        return
+    log.info("unloading Vosk model (idle)")
+    _asr_recognizer = None
+    _asr_model = None
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _maybe_unload_asr():
+    if _asr_model is None:
+        return
+    if _asr_last_used <= 0:
+        return
+    idle = time.monotonic() - _asr_last_used
+    if idle >= ASR_IDLE_UNLOAD_SEC:
+        _unload_asr()
+
+
 def _read_wav_16k_mono(path: str):
     with wave.open(path, "rb") as wf:
         n_channels = wf.getnchannels()
@@ -506,6 +538,7 @@ def _read_wav_16k_mono(path: str):
 
 
 async def _transcribe_audio(wav_path: str) -> Optional[str]:
+    global _asr_last_used
     lock = _get_asr_lock()
     async with lock:
         try:
@@ -523,6 +556,7 @@ async def _transcribe_audio(wav_path: str) -> Optional[str]:
 
     try:
         text = await asyncio.to_thread(_run)
+        _asr_last_used = time.monotonic()
         return text or None
     except Exception as e:
         log.error("Vosk transcribe fail: %s", e)
@@ -1689,6 +1723,11 @@ async def _housekeeping():
                 log.debug("messages cleanup: %s", e)
 
             try:
+                _maybe_unload_asr()
+            except Exception as e:
+                log.debug("unload asr: %s", e)
+
+            try:
                 gc.collect()
             except Exception:
                 pass
@@ -1701,7 +1740,7 @@ async def _housekeeping():
 
         except Exception as e:
             log.debug("housekeeping: %s", e)
-        await asyncio.sleep(300)
+        await asyncio.sleep(HOUSEKEEPING_INTERVAL)
 
 
 async def _watchdog(app: Application):
@@ -4237,6 +4276,10 @@ async def _shutdown_app(app: Application):
             await step()
         except Exception as e:
             log.debug("shutdown step: %s", e)
+    try:
+        _unload_asr()
+    except Exception:
+        pass
     log.info("app shut down.")
 
 
