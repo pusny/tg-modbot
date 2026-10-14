@@ -1,5 +1,9 @@
 import subprocess
 import sys
+import tarfile
+import urllib.request
+import shutil
+from pathlib import Path
 
 
 def _ensure(pkg_spec: str, import_name: str) -> None:
@@ -11,7 +15,8 @@ def _ensure(pkg_spec: str, import_name: str) -> None:
 
 _ensure("python-telegram-bot>=22,<24", "telegram")
 _ensure("python-dotenv", "dotenv")
-_ensure("faster-whisper", "faster_whisper")
+_ensure("sherpa-onnx", "sherpa_onnx")
+_ensure("numpy", "numpy")
 
 
 import asyncio
@@ -22,7 +27,6 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import sqlite3
 import string
 import tempfile
@@ -61,8 +65,8 @@ ADMIN_THREAD_ID  = _req_int("ADMIN_THREAD_ID", 0) or None
 REPORT_CHAT_ID   = _req_int("REPORT_CHAT_ID")
 REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
 
-WHISPER_MODEL    = (os.getenv("WHISPER_MODEL") or "small").strip()
-WHISPER_LANG     = (os.getenv("WHISPER_LANG") or "ru").strip()
+GIGAAM_MODEL_DIR  = (os.getenv("GIGAAM_MODEL_DIR") or "/app/data/gigaam").strip()
+GIGAAM_MODEL_NAME = (os.getenv("GIGAAM_MODEL_NAME") or "sherpa-onnx-nemo-ctc-giga-am-v2-russian-2025-04-19").strip()
 
 _data_dir = (os.getenv("DATA_DIR") or "").strip()
 if _data_dir:
@@ -187,7 +191,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TimedOut, RetryAfter
+from telegram.error import Conflict, NetworkError, TimedOut, RetryAfter
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -220,7 +224,7 @@ log.info("Config loaded | cwd=%s | admin=%s | admin_thread=%s | report_chat=%s |
          Path.cwd(), ADMIN_CHAT_ID, ADMIN_THREAD_ID, REPORT_CHAT_ID, REPORT_THREAD_ID)
 log.info("DB path → %s (dir=%s, persist=%s)",
          DB_PATH, DB_DIR, "yes" if _persist_ok else "NEW/UNKNOWN")
-log.info("Whisper model → %s | lang=%s", WHISPER_MODEL, WHISPER_LANG)
+log.info("GigaAM model → %s | dir=%s", GIGAAM_MODEL_NAME, GIGAAM_MODEL_DIR)
 
 if not _persist_ok:
     log.warning(
@@ -364,8 +368,8 @@ _seen_mod_cmds: dict = {}
 _watchdog_fails = 0
 _restart_event: Optional[asyncio.Event] = None
 
-_whisper_model = None
-_whisper_lock: Optional[asyncio.Lock] = None
+_asr_recognizer = None
+_asr_lock: Optional[asyncio.Lock] = None
 
 
 def _request_restart(reason: str = ""):
@@ -392,51 +396,114 @@ def _get_read_sem() -> asyncio.Semaphore:
     return _db_read_sem
 
 
-def _get_whisper_lock() -> asyncio.Lock:
-    global _whisper_lock
-    if _whisper_lock is None:
-        _whisper_lock = asyncio.Lock()
-    return _whisper_lock
+def _get_asr_lock() -> asyncio.Lock:
+    global _asr_lock
+    if _asr_lock is None:
+        _asr_lock = asyncio.Lock()
+    return _asr_lock
 
 
-def _load_whisper():
-    global _whisper_model
-    if _whisper_model is not None:
-        return _whisper_model
-    from faster_whisper import WhisperModel
-    log.info("loading whisper model %s (first run downloads it)…", WHISPER_MODEL)
-    _whisper_model = WhisperModel(
-        WHISPER_MODEL,
-        device="cpu",
-        compute_type="int8",
+def _download_model_if_needed():
+    model_dir = Path(GIGAAM_MODEL_DIR)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    tar_name = f"{GIGAAM_MODEL_NAME}.tar.bz2"
+    model_path = model_dir / GIGAAM_MODEL_NAME
+    tar_path = model_dir / tar_name
+
+    if model_path.exists() and (model_path / "model.int8.onnx").exists():
+        log.info("GigaAM model already exists at %s", model_path)
+        return
+
+    if not tar_path.exists():
+        url = (
+            f"https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+            f"{tar_name}"
+        )
+        log.info("Downloading GigaAM model from %s …", url)
+        try:
+            urllib.request.urlretrieve(url, tar_path)
+            log.info("Download complete: %s", tar_path)
+        except Exception as e:
+            log.error("Failed to download GigaAM model: %s", e)
+            raise
+
+    log.info("Extracting %s …", tar_path)
+    try:
+        with tarfile.open(tar_path, "r:bz2") as tar:
+            tar.extractall(model_dir)
+        log.info("Extraction complete.")
+    except Exception as e:
+        log.error("Failed to extract GigaAM model: %s", e)
+        raise
+    finally:
+        if tar_path.exists():
+            tar_path.unlink()
+            log.info("Removed archive %s", tar_path)
+
+
+def _load_asr():
+    global _asr_recognizer
+    if _asr_recognizer is not None:
+        return _asr_recognizer
+
+    import sherpa_onnx
+
+    _download_model_if_needed()
+
+    model_path = Path(GIGAAM_MODEL_DIR) / GIGAAM_MODEL_NAME
+
+    model_file = model_path / "model.int8.onnx"
+    tokens_file = model_path / "tokens.txt"
+
+    if not model_file.exists():
+        raise FileNotFoundError(f"Model file not found: {model_file}")
+    if not tokens_file.exists():
+        raise FileNotFoundError(f"Tokens file not found: {tokens_file}")
+
+    log.info("Loading GigaAM ASR model from %s …", model_path)
+    _asr_recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+        model=str(model_file),
+        tokens=str(tokens_file),
+        num_threads=2,
+        sample_rate=16000,
+        feature_dim=64,
+        decoding_method="greedy_search",
     )
-    log.info("whisper model ready.")
-    return _whisper_model
+    log.info("GigaAM ASR model ready.")
+    return _asr_recognizer
 
 
 async def _transcribe_audio(path: str) -> Optional[str]:
-    lock = _get_whisper_lock()
+    lock = _get_asr_lock()
     async with lock:
         try:
-            model = await asyncio.to_thread(_load_whisper)
+            recognizer = await asyncio.to_thread(_load_asr)
         except Exception as e:
-            log.error("whisper load fail: %s", e)
+            log.error("GigaAM load fail: %s", e)
             return None
 
     def _run():
-        segments, info = model.transcribe(
-            path,
-            language=WHISPER_LANG or None,
-            beam_size=5,
-            vad_filter=True,
-        )
-        return " ".join(seg.text.strip() for seg in segments).strip()
+        import numpy as np
+        import soundfile as sf
+
+        audio, sr = sf.read(path)
+        if len(audio.shape) > 1:
+            audio = audio.mean(axis=1)
+        if sr != 16000:
+            log.warning("Sample rate is %d, expected 16000", sr)
+            return None
+
+        stream = recognizer.create_stream()
+        stream.accept_waveform(16000, audio)
+        recognizer.decode_stream(stream)
+        return stream.result.text.strip()
 
     try:
         text = await asyncio.to_thread(_run)
         return text or None
     except Exception as e:
-        log.error("whisper transcribe fail: %s", e)
+        log.error("GigaAM transcribe fail: %s", e)
         return None
 
 
@@ -4088,6 +4155,13 @@ async def _start_with_retry() -> Application:
             )
             log.info("Bot running. Ctrl+C to stop.")
             return app
+        except Conflict as e:
+            log.warning("Conflict: другая сессия поллит токен. Жду 45 сек… (%s)", e)
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+            await asyncio.sleep(45)
         except (TimedOut, NetworkError) as e:
             log.warning("Сеть недоступна (%s). Жду %.0f сек…",
                         type(e).__name__, START_RETRY_DELAY)
@@ -4103,10 +4177,13 @@ async def _start_with_retry() -> Application:
 
 async def _shutdown_app(app: Application):
     log.info("shutting down app…")
-    for step in (app.updater.stop if app.updater else None,
-                 app.stop, app.shutdown):
-        if step is None:
-            continue
+    if app.updater is not None:
+        try:
+            await app.updater.stop()
+            await asyncio.sleep(2)
+        except Exception as e:
+            log.debug("updater.stop: %s", e)
+    for step in (app.stop, app.shutdown):
         try:
             await step()
         except Exception as e:
@@ -4168,7 +4245,7 @@ async def _run_bot():
         except Exception:
             pass
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(10)
 
 
 def main():
