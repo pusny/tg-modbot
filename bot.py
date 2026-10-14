@@ -31,11 +31,13 @@ import sqlite3
 import string
 import tempfile
 import time
+import wave
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -67,6 +69,9 @@ REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
 
 GIGAAM_MODEL_DIR  = (os.getenv("GIGAAM_MODEL_DIR") or "/app/data/gigaam").strip()
 GIGAAM_MODEL_NAME = (os.getenv("GIGAAM_MODEL_NAME") or "sherpa-onnx-nemo-ctc-giga-am-v2-russian-2025-04-19").strip()
+
+if not GIGAAM_MODEL_DIR.startswith("/"):
+    GIGAAM_MODEL_DIR = "/" + GIGAAM_MODEL_DIR
 
 _data_dir = (os.getenv("DATA_DIR") or "").strip()
 if _data_dir:
@@ -231,6 +236,9 @@ if not _persist_ok:
         "⚠️  Маркер персистентности отсутствует — это первый запуск "
         "либо volume НЕ сохраняется между пересборками."
     )
+
+if shutil.which("ffmpeg") is None:
+    log.warning("⚠️  ffmpeg не найден — голосовые и видеокружки не будут расшифровываться")
 
 
 _acted = contextvars.ContextVar("worm_acted", default=False)
@@ -474,7 +482,29 @@ def _load_asr():
     return _asr_recognizer
 
 
-async def _transcribe_audio(path: str) -> Optional[str]:
+def _read_wav_16k_mono(path: str):
+    with wave.open(path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+
+    if sampwidth != 2:
+        raise ValueError(f"Unsupported sample width: {sampwidth}")
+
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    if n_channels > 1:
+        samples = samples.reshape(-1, n_channels).mean(axis=1)
+
+    if framerate != 16000:
+        raise ValueError(f"Unsupported sample rate: {framerate}")
+
+    return samples
+
+
+async def _transcribe_audio(wav_path: str) -> Optional[str]:
     lock = _get_asr_lock()
     async with lock:
         try:
@@ -484,18 +514,9 @@ async def _transcribe_audio(path: str) -> Optional[str]:
             return None
 
     def _run():
-        import numpy as np
-        import soundfile as sf
-
-        audio, sr = sf.read(path)
-        if len(audio.shape) > 1:
-            audio = audio.mean(axis=1)
-        if sr != 16000:
-            log.warning("Sample rate is %d, expected 16000", sr)
-            return None
-
+        samples = _read_wav_16k_mono(wav_path)
         stream = recognizer.create_stream()
-        stream.accept_waveform(16000, audio)
+        stream.accept_waveform(16000, samples)
         recognizer.decode_stream(stream)
         return stream.result.text.strip()
 
@@ -505,6 +526,30 @@ async def _transcribe_audio(path: str) -> Optional[str]:
     except Exception as e:
         log.error("GigaAM transcribe fail: %s", e)
         return None
+
+
+async def _convert_to_wav_16k_mono(src_path: str, dst_path: str) -> bool:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        log.warning("ffmpeg not found — конвертация в wav не сделана")
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-y", "-i", src_path,
+            "-vn", "-ac", "1", "-ar", "16000",
+            "-acodec", "pcm_s16le",
+            "-f", "wav", dst_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        if proc.returncode != 0:
+            log.warning("ffmpeg fail rc=%s", proc.returncode)
+            return False
+        return True
+    except Exception as e:
+        log.warning("ffmpeg exec fail: %s", e)
+        return False
 
 
 def _task_done(task):
@@ -3909,10 +3954,16 @@ async def _handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp_path = tmp.name
+        src_path = tmp.name
+    wav_path = src_path + ".wav"
     try:
-        await file.download_to_drive(tmp_path)
-        text = await _transcribe_audio(tmp_path)
+        await file.download_to_drive(src_path)
+        ok = await _convert_to_wav_16k_mono(src_path, wav_path)
+        if not ok:
+            await eph(msg, "🎤 <i>ошибка конвертации аудио</i>",
+                      disable_notification=True)
+            return
+        text = await _transcribe_audio(wav_path)
         if not text:
             await eph(msg, "🎤 <i>не удалось распознать</i>",
                       disable_notification=True)
@@ -3920,10 +3971,11 @@ async def _handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await eph(msg, f"🎤 <b>Расшифровка:</b>\n{esc(text)}",
                   parse_mode=ParseMode.HTML, disable_notification=True)
     finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        for p in (src_path, wav_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 async def _handle_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3942,20 +3994,10 @@ async def _handle_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     wav_path = src_path + ".wav"
     try:
         await file.download_to_drive(src_path)
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is None:
-            log.warning("ffmpeg not found — video note transcription skipped")
-            return
-        proc = await asyncio.create_subprocess_exec(
-            ffmpeg, "-y", "-i", src_path,
-            "-vn", "-ac", "1", "-ar", "16000",
-            "-f", "wav", wav_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
-        if proc.returncode != 0:
-            log.warning("ffmpeg fail rc=%s", proc.returncode)
+        ok = await _convert_to_wav_16k_mono(src_path, wav_path)
+        if not ok:
+            await eph(msg, "📹 <i>ошибка конвертации аудио</i>",
+                      disable_notification=True)
             return
         text = await _transcribe_audio(wav_path)
         if not text:
