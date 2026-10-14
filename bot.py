@@ -1,6 +1,6 @@
 import subprocess
 import sys
-import tarfile
+import zipfile
 import urllib.request
 import shutil
 from pathlib import Path
@@ -15,7 +15,7 @@ def _ensure(pkg_spec: str, import_name: str) -> None:
 
 _ensure("python-telegram-bot>=22,<24", "telegram")
 _ensure("python-dotenv", "dotenv")
-_ensure("sherpa-onnx", "sherpa_onnx")
+_ensure("vosk", "vosk")
 _ensure("numpy", "numpy")
 
 
@@ -23,6 +23,7 @@ import asyncio
 import contextvars
 import gc
 import html
+import json
 import logging
 import os
 import re
@@ -67,11 +68,12 @@ ADMIN_THREAD_ID  = _req_int("ADMIN_THREAD_ID", 0) or None
 REPORT_CHAT_ID   = _req_int("REPORT_CHAT_ID")
 REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
 
-GIGAAM_MODEL_DIR  = (os.getenv("GIGAAM_MODEL_DIR") or "/app/data/gigaam").strip()
-GIGAAM_MODEL_NAME = (os.getenv("GIGAAM_MODEL_NAME") or "sherpa-onnx-nemo-ctc-giga-am-v2-russian-2025-04-19").strip()
+VOSK_MODEL_DIR = (os.getenv("VOSK_MODEL_DIR") or "/app/data/vosk").strip()
+if not VOSK_MODEL_DIR.startswith("/"):
+    VOSK_MODEL_DIR = "/" + VOSK_MODEL_DIR
 
-if not GIGAAM_MODEL_DIR.startswith("/"):
-    GIGAAM_MODEL_DIR = "/" + GIGAAM_MODEL_DIR
+VOSK_MODEL_NAME = "vosk-model-small-ru-0.22"
+VOSK_MODEL_URL  = f"https://alphacephei.com/vosk/models/{VOSK_MODEL_NAME}.zip"
 
 _data_dir = (os.getenv("DATA_DIR") or "").strip()
 if _data_dir:
@@ -229,7 +231,7 @@ log.info("Config loaded | cwd=%s | admin=%s | admin_thread=%s | report_chat=%s |
          Path.cwd(), ADMIN_CHAT_ID, ADMIN_THREAD_ID, REPORT_CHAT_ID, REPORT_THREAD_ID)
 log.info("DB path → %s (dir=%s, persist=%s)",
          DB_PATH, DB_DIR, "yes" if _persist_ok else "NEW/UNKNOWN")
-log.info("GigaAM model → %s | dir=%s", GIGAAM_MODEL_NAME, GIGAAM_MODEL_DIR)
+log.info("Vosk model → %s | dir=%s", VOSK_MODEL_NAME, VOSK_MODEL_DIR)
 
 if not _persist_ok:
     log.warning(
@@ -376,7 +378,7 @@ _seen_mod_cmds: dict = {}
 _watchdog_fails = 0
 _restart_event: Optional[asyncio.Event] = None
 
-_asr_recognizer = None
+_asr_model = None
 _asr_lock: Optional[asyncio.Lock] = None
 
 
@@ -411,75 +413,53 @@ def _get_asr_lock() -> asyncio.Lock:
     return _asr_lock
 
 
-def _download_model_if_needed():
-    model_dir = Path(GIGAAM_MODEL_DIR)
+def _download_vosk_model_if_needed() -> Path:
+    model_dir = Path(VOSK_MODEL_DIR)
     model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / VOSK_MODEL_NAME
 
-    tar_name = f"{GIGAAM_MODEL_NAME}.tar.bz2"
-    model_path = model_dir / GIGAAM_MODEL_NAME
-    tar_path = model_dir / tar_name
+    if model_path.exists() and (model_path / "am").exists():
+        log.info("Vosk model already exists at %s", model_path)
+        return model_path
 
-    if model_path.exists() and (model_path / "model.int8.onnx").exists():
-        log.info("GigaAM model already exists at %s", model_path)
-        return
-
-    if not tar_path.exists():
-        url = (
-            f"https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
-            f"{tar_name}"
-        )
-        log.info("Downloading GigaAM model from %s …", url)
-        try:
-            urllib.request.urlretrieve(url, tar_path)
-            log.info("Download complete: %s", tar_path)
-        except Exception as e:
-            log.error("Failed to download GigaAM model: %s", e)
-            raise
-
-    log.info("Extracting %s …", tar_path)
+    zip_path = model_dir / f"{VOSK_MODEL_NAME}.zip"
+    log.info("Downloading Vosk model from %s …", VOSK_MODEL_URL)
     try:
-        with tarfile.open(tar_path, "r:bz2") as tar:
-            tar.extractall(model_dir)
+        urllib.request.urlretrieve(VOSK_MODEL_URL, zip_path)
+        log.info("Download complete: %s", zip_path)
+    except Exception as e:
+        log.error("Failed to download Vosk model: %s", e)
+        raise
+
+    log.info("Extracting %s …", zip_path)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(model_dir)
         log.info("Extraction complete.")
     except Exception as e:
-        log.error("Failed to extract GigaAM model: %s", e)
+        log.error("Failed to extract Vosk model: %s", e)
         raise
     finally:
-        if tar_path.exists():
-            tar_path.unlink()
-            log.info("Removed archive %s", tar_path)
+        if zip_path.exists():
+            zip_path.unlink()
+            log.info("Removed archive %s", zip_path)
+
+    return model_path
 
 
 def _load_asr():
-    global _asr_recognizer
-    if _asr_recognizer is not None:
-        return _asr_recognizer
+    global _asr_model
+    if _asr_model is not None:
+        return _asr_model
 
-    import sherpa_onnx
+    import vosk
 
-    _download_model_if_needed()
-
-    model_path = Path(GIGAAM_MODEL_DIR) / GIGAAM_MODEL_NAME
-
-    model_file = model_path / "model.int8.onnx"
-    tokens_file = model_path / "tokens.txt"
-
-    if not model_file.exists():
-        raise FileNotFoundError(f"Model file not found: {model_file}")
-    if not tokens_file.exists():
-        raise FileNotFoundError(f"Tokens file not found: {tokens_file}")
-
-    log.info("Loading GigaAM ASR model from %s …", model_path)
-    _asr_recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
-        model=str(model_file),
-        tokens=str(tokens_file),
-        num_threads=2,
-        sample_rate=16000,
-        feature_dim=64,
-        decoding_method="greedy_search",
-    )
-    log.info("GigaAM ASR model ready.")
-    return _asr_recognizer
+    model_path = _download_vosk_model_if_needed()
+    log.info("Loading Vosk model from %s …", model_path)
+    vosk.SetLogLevel(-1)
+    _asr_model = vosk.Model(str(model_path))
+    log.info("Vosk model ready.")
+    return _asr_model
 
 
 def _read_wav_16k_mono(path: str):
@@ -492,39 +472,36 @@ def _read_wav_16k_mono(path: str):
 
     if sampwidth != 2:
         raise ValueError(f"Unsupported sample width: {sampwidth}")
-
-    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
-    if n_channels > 1:
-        samples = samples.reshape(-1, n_channels).mean(axis=1)
-
+    if n_channels != 1:
+        raise ValueError(f"Unsupported channels: {n_channels}")
     if framerate != 16000:
         raise ValueError(f"Unsupported sample rate: {framerate}")
 
-    return samples
+    return raw
 
 
 async def _transcribe_audio(wav_path: str) -> Optional[str]:
     lock = _get_asr_lock()
     async with lock:
         try:
-            recognizer = await asyncio.to_thread(_load_asr)
+            model = await asyncio.to_thread(_load_asr)
         except Exception as e:
-            log.error("GigaAM load fail: %s", e)
+            log.error("Vosk load fail: %s", e)
             return None
 
     def _run():
-        samples = _read_wav_16k_mono(wav_path)
-        stream = recognizer.create_stream()
-        stream.accept_waveform(16000, samples)
-        recognizer.decode_stream(stream)
-        return stream.result.text.strip()
+        import vosk
+        raw = _read_wav_16k_mono(wav_path)
+        rec = vosk.KaldiRecognizer(model, 16000)
+        rec.AcceptWaveform(raw)
+        result = json.loads(rec.FinalResult())
+        return (result.get("text") or "").strip()
 
     try:
         text = await asyncio.to_thread(_run)
         return text or None
     except Exception as e:
-        log.error("GigaAM transcribe fail: %s", e)
+        log.error("Vosk transcribe fail: %s", e)
         return None
 
 
