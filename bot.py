@@ -11,6 +11,7 @@ def _ensure(pkg_spec: str, import_name: str) -> None:
 
 _ensure("python-telegram-bot>=22,<24", "telegram")
 _ensure("python-dotenv", "dotenv")
+_ensure("faster-whisper", "faster_whisper")
 
 
 import asyncio
@@ -24,6 +25,7 @@ import secrets
 import shutil
 import sqlite3
 import string
+import tempfile
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +60,9 @@ ADMIN_CHAT_ID    = _req_int("ADMIN_CHAT_ID")
 ADMIN_THREAD_ID  = _req_int("ADMIN_THREAD_ID", 0) or None
 REPORT_CHAT_ID   = _req_int("REPORT_CHAT_ID")
 REPORT_THREAD_ID = _req_int("REPORT_THREAD_ID", 0) or None
+
+WHISPER_MODEL    = (os.getenv("WHISPER_MODEL") or "small").strip()
+WHISPER_LANG     = (os.getenv("WHISPER_LANG") or "ru").strip()
 
 _data_dir = (os.getenv("DATA_DIR") or "").strip()
 if _data_dir:
@@ -215,6 +220,7 @@ log.info("Config loaded | cwd=%s | admin=%s | admin_thread=%s | report_chat=%s |
          Path.cwd(), ADMIN_CHAT_ID, ADMIN_THREAD_ID, REPORT_CHAT_ID, REPORT_THREAD_ID)
 log.info("DB path → %s (dir=%s, persist=%s)",
          DB_PATH, DB_DIR, "yes" if _persist_ok else "NEW/UNKNOWN")
+log.info("Whisper model → %s | lang=%s", WHISPER_MODEL, WHISPER_LANG)
 
 if not _persist_ok:
     log.warning(
@@ -358,6 +364,9 @@ _seen_mod_cmds: dict = {}
 _watchdog_fails = 0
 _restart_event: Optional[asyncio.Event] = None
 
+_whisper_model = None
+_whisper_lock: Optional[asyncio.Lock] = None
+
 
 def _request_restart(reason: str = ""):
     global _restart_event
@@ -381,6 +390,54 @@ def _get_read_sem() -> asyncio.Semaphore:
     if _db_read_sem is None:
         _db_read_sem = asyncio.Semaphore(DB_READ_SEMAPHORE)
     return _db_read_sem
+
+
+def _get_whisper_lock() -> asyncio.Lock:
+    global _whisper_lock
+    if _whisper_lock is None:
+        _whisper_lock = asyncio.Lock()
+    return _whisper_lock
+
+
+def _load_whisper():
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model
+    from faster_whisper import WhisperModel
+    log.info("loading whisper model %s (first run downloads it)…", WHISPER_MODEL)
+    _whisper_model = WhisperModel(
+        WHISPER_MODEL,
+        device="cpu",
+        compute_type="int8",
+    )
+    log.info("whisper model ready.")
+    return _whisper_model
+
+
+async def _transcribe_audio(path: str) -> Optional[str]:
+    lock = _get_whisper_lock()
+    async with lock:
+        try:
+            model = await asyncio.to_thread(_load_whisper)
+        except Exception as e:
+            log.error("whisper load fail: %s", e)
+            return None
+
+    def _run():
+        segments, info = model.transcribe(
+            path,
+            language=WHISPER_LANG or None,
+            beam_size=5,
+            vad_filter=True,
+        )
+        return " ".join(seg.text.strip() for seg in segments).strip()
+
+    try:
+        text = await asyncio.to_thread(_run)
+        return text or None
+    except Exception as e:
+        log.error("whisper transcribe fail: %s", e)
+        return None
 
 
 def _task_done(task):
@@ -3773,6 +3830,81 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await eph(msg, f"✅ {key_raw}: <b>{val}</b>", parse_mode=ParseMode.HTML)
 
 
+async def _handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or msg.voice is None:
+        return
+    if msg.chat.type == "private":
+        return
+
+    file = await safe(ctx.bot.get_file, msg.voice.file_id)
+    if file is None:
+        return
+
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        await file.download_to_drive(tmp_path)
+        text = await _transcribe_audio(tmp_path)
+        if not text:
+            await eph(msg, "🎤 <i>не удалось распознать</i>",
+                      disable_notification=True)
+            return
+        await eph(msg, f"🎤 <b>Расшифровка:</b>\n{esc(text)}",
+                  parse_mode=ParseMode.HTML, disable_notification=True)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+async def _handle_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or msg.video_note is None:
+        return
+    if msg.chat.type == "private":
+        return
+
+    file = await safe(ctx.bot.get_file, msg.video_note.file_id)
+    if file is None:
+        return
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        src_path = tmp.name
+    wav_path = src_path + ".wav"
+    try:
+        await file.download_to_drive(src_path)
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            log.warning("ffmpeg not found — video note transcription skipped")
+            return
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-y", "-i", src_path,
+            "-vn", "-ac", "1", "-ar", "16000",
+            "-f", "wav", wav_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        if proc.returncode != 0:
+            log.warning("ffmpeg fail rc=%s", proc.returncode)
+            return
+        text = await _transcribe_audio(wav_path)
+        if not text:
+            await eph(msg, "📹 <i>не удалось распознать</i>",
+                      disable_notification=True)
+            return
+        await eph(msg, f"📹 <b>Расшифровка:</b>\n{esc(text)}",
+                  parse_mode=ParseMode.HTML, disable_notification=True)
+    finally:
+        for p in (src_path, wav_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+
+
 async def _post_init(app: Application):
     try:
         await app.bot.set_my_commands([
@@ -3879,6 +4011,9 @@ async def _build_app() -> Application:
     app.add_handler(CommandHandler("activate", cmd_activate, filters=G))
 
     app.add_handler(MessageHandler(G, pre_remember), group=-4)
+
+    app.add_handler(MessageHandler(G & filters.VOICE, _handle_voice), group=-1)
+    app.add_handler(MessageHandler(G & filters.VIDEO_NOTE, _handle_video_note), group=-1)
 
     app.add_handler(MessageHandler(G & ~filters.COMMAND, antispam_mw), group=-3)
     app.add_handler(MessageHandler(G & (filters.TEXT | filters.CAPTION), link_guard_mw), group=-2)
