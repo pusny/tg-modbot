@@ -17,6 +17,7 @@ _ensure("python-telegram-bot>=22,<24", "telegram")
 _ensure("python-dotenv", "dotenv")
 _ensure("vosk", "vosk")
 _ensure("numpy", "numpy")
+_ensure("imageio-ffmpeg", "imageio_ffmpeg")
 
 
 import asyncio
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import imageio_ffmpeg
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -239,9 +241,6 @@ if not _persist_ok:
         "либо volume НЕ сохраняется между пересборками."
     )
 
-if shutil.which("ffmpeg") is None:
-    log.warning("⚠️  ffmpeg не найден — голосовые и видеокружки не будут расшифровываться")
-
 
 _acted = contextvars.ContextVar("worm_acted", default=False)
 
@@ -380,6 +379,7 @@ _restart_event: Optional[asyncio.Event] = None
 
 _asr_model = None
 _asr_lock: Optional[asyncio.Lock] = None
+_ffmpeg_path: Optional[str] = None
 
 
 def _request_restart(reason: str = ""):
@@ -411,6 +411,29 @@ def _get_asr_lock() -> asyncio.Lock:
     if _asr_lock is None:
         _asr_lock = asyncio.Lock()
     return _asr_lock
+
+
+def _resolve_ffmpeg() -> Optional[str]:
+    global _ffmpeg_path
+    if _ffmpeg_path is not None:
+        return _ffmpeg_path
+    path = shutil.which("ffmpeg")
+    if path:
+        _ffmpeg_path = path
+        return path
+    try:
+        _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        return _ffmpeg_path
+    except Exception as e:
+        log.error("не смог получить ffmpeg из imageio-ffmpeg: %s", e)
+        return None
+
+
+_ff_resolved = _resolve_ffmpeg()
+if _ff_resolved is None:
+    log.warning("⚠️  ffmpeg не найден ни в PATH, ни в imageio-ffmpeg — голосовые и видеокружки не будут расшифровываться")
+else:
+    log.info("ffmpeg → %s", _ff_resolved)
 
 
 def _download_vosk_model_if_needed() -> Path:
@@ -506,9 +529,9 @@ async def _transcribe_audio(wav_path: str) -> Optional[str]:
 
 
 async def _convert_to_wav_16k_mono(src_path: str, dst_path: str) -> bool:
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        log.warning("ffmpeg not found — конвертация в wav не сделана")
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        log.warning("ffmpeg недоступен — конвертация в wav не сделана")
         return False
     try:
         proc = await asyncio.create_subprocess_exec(
