@@ -378,6 +378,7 @@ _watchdog_fails = 0
 _restart_event: Optional[asyncio.Event] = None
 
 _asr_model = None
+_asr_recognizer = None
 _asr_lock: Optional[asyncio.Lock] = None
 _ffmpeg_path: Optional[str] = None
 
@@ -471,9 +472,9 @@ def _download_vosk_model_if_needed() -> Path:
 
 
 def _load_asr():
-    global _asr_model
-    if _asr_model is not None:
-        return _asr_model
+    global _asr_model, _asr_recognizer
+    if _asr_model is not None and _asr_recognizer is not None:
+        return _asr_model, _asr_recognizer
 
     import vosk
 
@@ -481,8 +482,9 @@ def _load_asr():
     log.info("Loading Vosk model from %s …", model_path)
     vosk.SetLogLevel(-1)
     _asr_model = vosk.Model(str(model_path))
+    _asr_recognizer = vosk.KaldiRecognizer(_asr_model, 16000)
     log.info("Vosk model ready.")
-    return _asr_model
+    return _asr_model, _asr_recognizer
 
 
 def _read_wav_16k_mono(path: str):
@@ -507,15 +509,14 @@ async def _transcribe_audio(wav_path: str) -> Optional[str]:
     lock = _get_asr_lock()
     async with lock:
         try:
-            model = await asyncio.to_thread(_load_asr)
+            model, rec = await asyncio.to_thread(_load_asr)
         except Exception as e:
             log.error("Vosk load fail: %s", e)
             return None
 
     def _run():
-        import vosk
         raw = _read_wav_16k_mono(wav_path)
-        rec = vosk.KaldiRecognizer(model, 16000)
+        rec.Reset()
         rec.AcceptWaveform(raw)
         result = json.loads(rec.FinalResult())
         return (result.get("text") or "").strip()
@@ -1689,6 +1690,12 @@ async def _housekeeping():
 
             try:
                 gc.collect()
+            except Exception:
+                pass
+
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
             except Exception:
                 pass
 
