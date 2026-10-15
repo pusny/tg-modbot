@@ -194,6 +194,9 @@ DB_EXECUTORS = 4
 ASR_IDLE_UNLOAD_SEC = 180
 HOUSEKEEPING_INTERVAL = 300
 
+MENTION_ALL_COOLDOWN = 300
+MENTION_ALL_CHUNK = 25
+
 
 from telegram import (
     BotCommand,
@@ -385,6 +388,8 @@ _asr_recognizer = None
 _asr_lock: Optional[asyncio.Lock] = None
 _asr_last_used: float = 0.0
 _ffmpeg_path: Optional[str] = None
+
+_mention_last_used: dict = {}
 
 
 def _request_restart(reason: str = ""):
@@ -1708,6 +1713,10 @@ async def _housekeeping():
                 if now - _seen_mod_cmds[k] > MOD_CMD_DUP_TTL:
                     _seen_mod_cmds.pop(k, None)
 
+            for k in list(_mention_last_used.keys()):
+                if time.time() - _mention_last_used[k] > MENTION_ALL_COOLDOWN * 4:
+                    _mention_last_used.pop(k, None)
+
             try:
                 _wal_checkpoint(passive=True)
             except Exception:
@@ -2343,6 +2352,66 @@ async def cmd_activate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_mention_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None or msg.chat.type == "private":
+        return
+    if user.is_bot:
+        return
+
+    chat_id = msg.chat.id
+
+    my_rank = await resolve_rank(ctx.bot, chat_id, user.id)
+    if my_rank < RANK_JUNIOR_MOD:
+        return
+
+    now = time.time()
+    last = _mention_last_used.get(chat_id, 0)
+    if now - last < MENTION_ALL_COOLDOWN:
+        wait = int(MENTION_ALL_COOLDOWN - (now - last))
+        await safe(msg.delete)
+        await eph(msg, f"⏳ Подожди ещё {fmt_seconds(wait)} до следующего упоминания.")
+        return
+    _mention_last_used[chat_id] = now
+
+    rows = await db_exec(
+        "SELECT user_id FROM users WHERE chat_id=? ORDER BY user_id",
+        (chat_id,), fetch="all",
+    ) or []
+
+    ids = [r["user_id"] for r in rows if r["user_id"] != user.id]
+    if not ids:
+        await safe(msg.delete)
+        await eph(msg, "📭 Некого упоминать.")
+        return
+
+    await safe(msg.delete)
+
+    mention_html = "".join(
+        f'<a href="tg://user?id={uid}">\u2063</a>' for uid in ids
+    )
+    header = "📢 <b>Внимание, все!</b>\n"
+
+    total = len(ids)
+    chunks = [ids[i:i + MENTION_ALL_CHUNK] for i in range(0, total, MENTION_ALL_CHUNK)]
+
+    first = True
+    for idx, ch in enumerate(chunks, start=1):
+        body = "".join(f'<a href="tg://user?id={uid}">\u2063</a>' for uid in ch)
+        text = (header if first else "") + body
+        kwargs = {"parse_mode": ParseMode.HTML}
+        if msg.message_thread_id:
+            kwargs["message_thread_id"] = msg.message_thread_id
+        sent = await safe(ctx.bot.send_message, chat_id, text, **kwargs)
+        if sent is not None:
+            await _remember_sent(sent, msg.message_thread_id or 0)
+        first = False
+        await asyncio.sleep(0.6)
+
+    log.info("mention_all: chat=%s by=%s total=%d", chat_id, user.id, total)
+
+
 HELP_HEADER = "<b>🛠 Команды</b>\n"
 
 HELP_BLOCKS = {
@@ -2386,7 +2455,9 @@ HELP_BLOCKS = {
         "<code>чистка [N]</code>\n\n"
         "<b>👥 Кружки</b>\n"
         "<code>создатькружок [имя]</code>\n"
-        "<code>удалитькружок [имя]</code>\n\n",
+        "<code>удалитькружок [имя]</code>\n\n"
+        "<b>📢 Упоминания</b>\n"
+        "<code>всех</code> — упомянуть всех (кулдаун 5 мин)\n\n",
         RANK_JUNIOR_MOD,
     ),
     "everyone": (
@@ -4129,6 +4200,9 @@ RU_ALIASES = [
     (r"^удалитькружок(?:\s+.+)?$",         cmd_delete_circle),
     (r"^триггер(?:\s+.+)?$",               cmd_trigger),
     (r"^настройки(?:\s+.+)?$",             cmd_settings),
+    (r"^@(?:all|все|everyone|всех)$",      cmd_mention_all),
+    (r"^всех$",                            cmd_mention_all),
+    (r"^упомянутьвсех$",                   cmd_mention_all),
 ]
 
 
